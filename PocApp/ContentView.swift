@@ -10,31 +10,31 @@ struct ContentView: View {
 
     var body: some View {
         NavigationView {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    verdictCard
-                    diagnosisCard
-                    poc1Card
-                    keyboardCard
-                    backgroundCard
-                    clipboardCard
-                    logCard
+            ZStack(alignment: .bottom) {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        verdictCard
+                        diagnosisCard
+                        poc1Card
+                        keyboardCard
+                        backgroundCard
+                        clipboardCard
+                        logCard
+                    }
+                    .padding(16)
                 }
-                .padding(16)
+                if !model.toast.isEmpty {
+                    Text(model.toast)
+                        .font(.footnote)
+                        .padding(8)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Color(.secondarySystemBackground)))
+                        .padding(.bottom, 12)
+                }
             }
             .navigationTitle("iOS 采集 POC")
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("刷新") { model.refresh() }
-                }
-            }
-            .overlay(alignment: .bottom) {
-                if !model.toast.isEmpty {
-                    Text(model.toast)
-                        .font(.footnote)
-                        .padding(8)
-                        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
-                        .padding(.bottom, 12)
                 }
             }
         }
@@ -57,7 +57,6 @@ struct ContentView: View {
         section("诊断", systemImage: "stethoscope") {
             Text(model.report)
                 .font(.system(size: 11, design: .monospaced))
-                .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
         }
     }
@@ -71,8 +70,9 @@ struct ContentView: View {
             HStack(spacing: 12) {
                 Button("App 写入 10 条") { model.writeFromApp() }
                     .buttonStyle(.borderedProminent)
-                Button("清空日志", role: .destructive) { model.clearLog() }
+                Button("清空日志") { model.clearLog() }
                     .buttonStyle(.bordered)
+                    .foregroundColor(.red)
             }
         }
     }
@@ -163,7 +163,7 @@ struct ContentView: View {
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemBackground)))
     }
 
     private func color(for source: String) -> Color {
