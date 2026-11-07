@@ -1,0 +1,16 @@
+# 构建产物
+build/
+DerivedData/
+Payload/
+*.ipa
+*.dSYM
+*.xcarchive
+
+# Xcode 用户状态
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+project.xcworkspace/xcshareddata/IDEWorkspaceChecks.plist
+
+# 系统
+.DS_Store

@@ -1,0 +1,105 @@
+name: build-ipa
+
+# 云端 macOS runner 自带 Xcode + iOS SDK + Homebrew，可在没有本地 Xcode 的机器上产出未签名 IPA。
+# 触发：push 到 main/master，或在 Actions 页面点 "Run workflow"。
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 工具链信息
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun --sdk iphoneos --show-sdk-path
+          echo "---- targets ----"
+          xcodebuild -list -project PocApp.xcodeproj
+
+      - name: 编译（未签名）
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project PocApp.xcodeproj \
+            -target PocApp \
+            -configuration Release \
+            -sdk iphoneos \
+            SYMROOT="$PWD/build" \
+            OBJROOT="$PWD/build/obj" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee build.log
+
+      - name: 检查产物结构
+        run: |
+          set -euo pipefail
+          APP="build/Release-iphoneos/PocApp.app"
+          EXT="$APP/PlugIns/ClipKeyboard.appex"
+          echo "---- .app ----"
+          find "$APP" -maxdepth 2 | sort
+          test -d "$EXT" || { echo "::error::扩展没有被嵌入到 .app/PlugIns"; exit 1; }
+          echo "---- .appex ----"
+          find "$EXT" -maxdepth 2 | sort
+          test -f "$EXT/ClipKeyboard" || { echo "::error::缺少扩展可执行文件"; exit 1; }
+
+      - name: 写入 entitlements
+        run: |
+          set -euo pipefail
+          APP="build/Release-iphoneos/PocApp.app"
+          EXT="$APP/PlugIns/ClipKeyboard.appex"
+
+          brew install ldid >/dev/null 2>&1 || echo "ldid 安装失败，退回 codesign"
+
+          if command -v ldid >/dev/null 2>&1; then
+            ldid -S"$PWD/ClipKeyboard/ClipKeyboard.entitlements" "$EXT/ClipKeyboard"
+            ldid -S"$PWD/PocApp/PocApp.entitlements" "$APP/PocApp"
+            ldid -e "$APP/PocApp"           > build/check-app-entitlements.plist || true
+            ldid -e "$EXT/ClipKeyboard"     > build/check-ext-entitlements.plist || true
+          else
+            codesign --force --sign - --entitlements "$PWD/ClipKeyboard/ClipKeyboard.entitlements" "$EXT"
+            codesign --force --sign - --entitlements "$PWD/PocApp/PocApp.entitlements" "$APP"
+            codesign -d --entitlements :- "$APP" > build/check-app-entitlements.plist 2>/dev/null || true
+            codesign -d --entitlements :- "$EXT" > build/check-ext-entitlements.plist 2>/dev/null || true
+          fi
+
+          echo "---- App entitlements ----"
+          cat build/check-app-entitlements.plist || true
+          echo "---- Ext entitlements ----"
+          cat build/check-ext-entitlements.plist || true
+
+      - name: 打包 IPA
+        run: |
+          set -euo pipefail
+          APP="build/Release-iphoneos/PocApp.app"
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry PocApp.ipa Payload
+          ls -lh PocApp.ipa
+          unzip -l PocApp.ipa | head -20
+
+      - name: 上传 IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: PocApp-ipa
+          path: |
+            PocApp.ipa
+            build/check-app-entitlements.plist
+            build/check-ext-entitlements.plist
+          retention-days: 14
+
+      - name: 失败时上传日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          retention-days: 7
