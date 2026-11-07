@@ -11,6 +11,7 @@
 
 import UIKit
 
+@objc(KeyboardViewController)
 final class KeyboardViewController: UIInputViewController {
 
     // MARK: - UI
@@ -31,8 +32,6 @@ final class KeyboardViewController: UIInputViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         buildUI()
-        GroupStore.append(PocLogEntry(source: "keyboard", event: "kb_load",
-                                      detail: "container=\(GroupStore.containerURL?.path ?? "nil")"))
         reloadStatus()
     }
 
@@ -45,7 +44,9 @@ final class KeyboardViewController: UIInputViewController {
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
-        // 键盘出现后立刻做一次剪贴板探测，最接近真实产品行为
+        // 启动期不做文件 IO，先确认键盘能正常显示；随后再落日志与探测
+        GroupStore.append(PocLogEntry(source: "keyboard", event: "kb_load",
+                                      detail: "container=\(GroupStore.containerURL?.path ?? "nil")"))
         probePasteboard(reason: "on_appear")
     }
 

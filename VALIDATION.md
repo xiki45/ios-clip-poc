@@ -1,7 +1,7 @@
 # 交付自检报告
 
 > 生成时间：2026-11-07
-> 构建机：macOS + **Command Line Tools only**（无 Xcode、无 iPhoneOS SDK）
+> 构建机：macOS + Command Line Tools only（无 Xcode）→ 已改用 GitHub Actions 云端构建，产物见 README §0
 
 ## 0. 为什么本机编不出 IPA（事实）
 
