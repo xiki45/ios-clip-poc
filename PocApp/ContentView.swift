@@ -69,9 +69,9 @@ struct ContentView: View {
                 .fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 12) {
                 Button("App 写入 10 条") { model.writeFromApp() }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(FilledButtonStyle())
                 Button("清空日志") { model.clearLog() }
-                    .buttonStyle(.bordered)
+                    .buttonStyle(TintButtonStyle())
                     .foregroundColor(.red)
             }
         }
@@ -104,7 +104,7 @@ struct ContentView: View {
             Button(model.backgroundRunning ? "停止后台心跳" : "开始后台心跳（锁屏放 30 分钟）") {
                 model.toggleBackgroundHeartbeat()
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(TintButtonStyle())
             Text("普通签名通常 ~30s 后被杀；带 platform-application 等特权 entitlement 的自签包可能明显更久。日志里看 bg_heartbeat 的 elapsed 最大值。")
                 .font(.caption2)
                 .foregroundColor(.secondary)
@@ -118,7 +118,7 @@ struct ContentView: View {
                 Button("写入测试文本") { model.copyTestText() }
                 Button("App 读剪贴板") { model.readPasteboardFromApp() }
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(TintButtonStyle())
             Text("主 App 在前台时读剪贴板永远成功（对照组）。键盘侧读到什么，去日志里看 event=pasteboard_kb。")
                 .font(.caption2)
                 .foregroundColor(.secondary)
@@ -183,5 +183,32 @@ struct ContentView: View {
 struct ContentView_Previews: PreviewProvider {
     static var previews: some View {
         ContentView().environmentObject(AppModel())
+    }
+}
+
+// MARK: - iOS 13 兼容按钮样式（.bordered / .borderedProminent 是 iOS 15 API）
+
+struct FilledButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color.accentColor.opacity(configuration.isPressed ? 0.6 : 1.0))
+            )
+            .foregroundColor(.white)
+    }
+}
+
+struct TintButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color(.tertiarySystemBackground))
+            )
     }
 }
