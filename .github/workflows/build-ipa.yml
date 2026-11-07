@@ -100,6 +100,16 @@ jobs:
 
           ls -lh *.ipa
 
+      - name: 产出未签名版（交给 TrollStore 全权签名）
+        run: |
+          set -euo pipefail
+          rm -rf build/stage-raw && mkdir -p build/stage-raw/Payload
+          cp -R build/Release-iphoneos/PocApp.app build/stage-raw/Payload/PocApp.app
+          ( cd build/stage-raw && zip -qry "$OLDPWD/PocApp-raw.ipa" Payload && rm -rf Payload )
+          ls -lh PocApp-raw.ipa
+          echo "---- raw 版签名状态（应为 no signature）----"
+          codesign -dv build/stage-raw/Payload/PocApp.app/PocApp 2>&1 | head -3 || true
+
       - name: 上传 IPA
         uses: actions/upload-artifact@v4
         with:
@@ -107,6 +117,7 @@ jobs:
           path: |
             PocApp-codesign.ipa
             PocApp-ldid.ipa
+            PocApp-raw.ipa
             build/check-*.plist
           retention-days: 14
 
