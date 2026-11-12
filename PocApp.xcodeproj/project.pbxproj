@@ -126,6 +126,7 @@
 			isa = PBXGroup;
 			children = (
 				AA00000000000000000000F6 /* KeyboardViewController.swift */,
+				AA00000000000000000000DD /* ClipPanelView.swift */,
 				AA00000000000000000000F7 /* Info.plist */,
 				AA00000000000000000000F8 /* ClipKeyboard.entitlements */,
 			);
