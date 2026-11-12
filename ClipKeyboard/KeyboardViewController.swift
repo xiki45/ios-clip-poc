@@ -1,12 +1,9 @@
 //
 //  KeyboardViewController.swift
-//  ClipKeyboard
+//  剪贴板键盘 v1：采集 + 面板 + 点选插入 + 规则重写
 //
-//  POC 2 的全部验证都在这里：
-//   ① 键盘进程能否读写 App Group 容器（POC 1 的另一半）
-//   ② 键盘侧读 UIPasteboard 是否成功（Full Access 是否真正生效）
-//   ③ 键盘关闭后扩展是否被挂起（心跳停止即挂起，属正常行为）
-//   ④ 能否通过 textDocumentProxy 把内容插入宿主输入框（后续产品的上屏通道）
+//  采集时机：键盘可见期间轮询 changeCount（iOS 不允许后台读剪贴板，
+//  所以「打开键盘才采集」是这个平台上唯一可行的模式）。
 //
 
 import UIKit
@@ -14,221 +11,166 @@ import UIKit
 @objc(KeyboardViewController)
 final class KeyboardViewController: UIInputViewController {
 
-    // MARK: - UI
+    // 数据
+    private var store: ClipStore?
+    private var lastChangeCount = -1
 
+    // UI
+    private let panel = ClipPanelView()
+    private let toolbar = UIView()
     private let statusLabel = UILabel()
-    private let logLabel = UILabel()
-    private let headerStack = UIStackView()
-
-    // MARK: - 状态
-
-    private var heartbeatTimer: Timer?
-    private var tick = 0
-    private var appearedAt = Date()
-    private var lines: [String] = []
+    private var pollTimer: Timer?
 
     // MARK: - 生命周期
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        buildUI()
-        reloadStatus()
-    }
 
-    override func viewWillAppear(_ animated: Bool) {
-        super.viewWillAppear(animated)
-        appearedAt = Date()
-        log("kb_will_appear", "shared=\(GroupStore.effectiveDirectory?.isShared == true)")
-        startHeartbeat()
+        let dir = GroupStore.containerURL ?? GroupStore.privateDocumentsURL
+        if let dir {
+            store = ClipStore(directory: dir)
+        }
+
+        buildUI()
+        panel.bind(store: store)
+        panel.onPick = { [weak self] item in self?.insert(item) }
+        panel.onRewrite = { [weak self] item, step in self?.rewrite(item, step) }
+        panel.onPin = { [weak self] item in
+            self?.store?.togglePin(id: item.id)
+            self?.panel.reload()
+        }
+        panel.onDelete = { [weak self] item in
+            self?.store?.remove(id: item.id)
+            self?.panel.reload()
+        }
+        panel.onClose = { [weak self] in self?.advanceToNextInputMode() }
     }
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
-        // 启动期不做文件 IO，先确认键盘能正常显示；随后再落日志与探测
-        GroupStore.append(PocLogEntry(source: "keyboard", event: "kb_load",
-                                      detail: "container=\(GroupStore.containerURL?.path ?? "nil")"))
-        probePasteboard(reason: "on_appear")
+        capture()
+        startPolling()
     }
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        stopHeartbeat()
-        GroupStore.append(PocLogEntry(source: "keyboard", event: "kb_hide",
-                                      detail: "alive=\(Int(Date().timeIntervalSince(appearedAt)))s"))
-        GroupStore.writeHeartbeat([
-            "ts": Date().timeIntervalSince1970,
-            "source": "keyboard",
-            "state": "hidden",
-            "alive_seconds": Int(Date().timeIntervalSince(appearedAt))
-        ])
+        pollTimer?.invalidate()
+        pollTimer = nil
     }
 
-    // MARK: - 心跳
+    // MARK: - 采集
 
-    private func startHeartbeat() {
-        stopHeartbeat()
-        tick = 0
-        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            self.tick += 1
-            GroupStore.writeHeartbeat([
-                "ts": Date().timeIntervalSince1970,
-                "source": "keyboard",
-                "state": "visible",
-                "tick": self.tick,
-                "alive_seconds": Int(Date().timeIntervalSince(self.appearedAt)),
-                "shared": GroupStore.effectiveDirectory?.isShared == true
-            ])
-            if self.tick % 15 == 0 {
-                self.log("kb_heartbeat", "tick=\(self.tick)")
-            }
+    private func capture() {
+        let pb = UIPasteboard.general
+        guard pb.changeCount != lastChangeCount else { return }
+        lastChangeCount = pb.changeCount
+        guard let text = pb.string, !text.isEmpty else { return }
+        store?.upsert(text, source: "keyboard")
+        panel.reload()
+        updateStatus("已记录 \(store?.visibleItems().count ?? 0) 条")
+    }
+
+    private func startPolling() {
+        pollTimer?.invalidate()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+            self?.capture()
         }
-    }
-
-    private func stopHeartbeat() {
-        heartbeatTimer?.invalidate()
-        heartbeatTimer = nil
     }
 
     // MARK: - 动作
 
-    @objc private func writeFromKeyboard() {
-        let batch = (1...5).map {
-            PocLogEntry(source: "keyboard", event: "group_write",
-                        detail: "kb-batch #\($0) dir=\(GroupStore.effectiveDirectory?.isShared == true ? "group" : "private")")
+    private func insert(_ item: ClipItem) {
+        textDocumentProxy.insertText(item.text)
+        updateStatus("已插入 \(item.text.count) 字")
+    }
+
+    private func rewrite(_ item: ClipItem, _ step: RewriteStep) {
+        let result = Rewriter.apply(item.text, steps: [step])
+        guard result.ok else {
+            updateStatus(result.error ?? "重写失败")
+            return
         }
-        GroupStore.appendBulk(batch)
-        flash("已写入 5 条")
-        reloadStatus()
+        textDocumentProxy.insertText(result.output)
+        // 重写结果也存一条，便于二次使用
+        store?.upsert(result.output, source: "keyboard")
+        panel.reload()
+        updateStatus("\(step.op.displayName) → 已插入")
     }
 
-    @objc private func readPasteboard() {
-        probePasteboard(reason: "manual")
-        flash("已探测，详见日志")
-    }
-
-    @objc private func insertSample() {
-        let text = "「来自 ClipKeyboard」"
-        textDocumentProxy.insertText(text)
-        log("kb_insert", "text=\(text)")
-        flash("已插入测试文本")
-    }
-
-    @objc private func nextKeyboard() {
-        advanceToNextInputMode()
-    }
-
-    /// 剪贴板探测：把“能不能读”与“读到什么”分开记录，便于判断是权限问题还是内容问题
-    private func probePasteboard(reason: String) {
-        let pb = UIPasteboard.general
-        let hasStrings = pb.hasStrings
-        let changeCount = pb.changeCount
-        let began = Date()
-        let value = pb.string
-        let costMS = Int(Date().timeIntervalSince(began) * 1000)
-
-        let detail: String
-        if let v = value {
-            detail = "reason=\(reason) hasStrings=\(hasStrings) len=\(v.count) cost=\(costMS)ms preview=\(String(v.prefix(40)))"
-        } else {
-            detail = "reason=\(reason) hasStrings=\(hasStrings) len=nil cost=\(costMS)ms ← 读不到内容"
-        }
-
-        GroupStore.append(PocLogEntry(source: "keyboard", event: "pasteboard_kb", detail: detail))
-        log("pasteboard", "hasStrings=\(hasStrings) changeCount=\(changeCount) len=\(value?.count ?? -1)")
-        reloadStatus()
-    }
-
-    // MARK: - UI 构建
+    // MARK: - UI
 
     private func buildUI() {
         view.backgroundColor = .secondarySystemBackground
 
-        statusLabel.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
-        statusLabel.numberOfLines = 3
+        toolbar.backgroundColor = .tertiarySystemBackground
+        toolbar.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(toolbar)
+
+        let clipButton = makeButton("剪贴板", icon: "doc.on.clipboard")
+        clipButton.addTarget(self, action: #selector(showPanel), for: .touchUpInside)
+
+        let nextButton = makeButton("键盘", icon: "keyboard")
+        nextButton.addTarget(self, action: #selector(goNext), for: .touchUpInside)
+
+        let row = UIStackView(arrangedSubviews: [clipButton, statusLabel, nextButton])
+        row.axis = .horizontal
+        row.spacing = 8
+        row.alignment = .center
+        row.translatesAutoresizingMaskIntoConstraints = false
+        toolbar.addSubview(row)
+
+        statusLabel.font = .systemFont(ofSize: 10)
         statusLabel.textColor = .secondaryLabel
+        statusLabel.textAlignment = .center
+        statusLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
-        logLabel.font = .monospacedSystemFont(ofSize: 9, weight: .regular)
-        logLabel.numberOfLines = 6
-        logLabel.textColor = .tertiaryLabel
+        panel.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(panel)
 
-        let title = UILabel()
-        title.text = "ClipKeyboard · POC"
-        title.font = .systemFont(ofSize: 12, weight: .semibold)
-
-        let buttons = [
-            makeButton("键盘写入", action: #selector(writeFromKeyboard)),
-            makeButton("读剪贴板", action: #selector(readPasteboard)),
-            makeButton("插入文本", action: #selector(insertSample)),
-            makeButton("切键盘", action: #selector(nextKeyboard))
-        ]
-
-        let buttonRow = UIStackView(arrangedSubviews: buttons)
-        buttonRow.axis = .horizontal
-        buttonRow.distribution = .fillEqually
-        buttonRow.spacing = 6
-
-        let stack = UIStackView(arrangedSubviews: [title, statusLabel, buttonRow, logLabel])
-        stack.axis = .vertical
-        stack.spacing = 8
-        stack.alignment = .fill
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(stack)
-
-        // 键盘高度：用低优先级的固定高度，避免与系统容器约束硬冲突
-        let height = view.heightAnchor.constraint(equalToConstant: 230)
+        let height = view.heightAnchor.constraint(equalToConstant: 268)
         height.priority = .defaultHigh
 
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 10),
-            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -10),
-            stack.topAnchor.constraint(equalTo: view.topAnchor, constant: 8),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: view.bottomAnchor, constant: -8),
+            toolbar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            toolbar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            toolbar.topAnchor.constraint(equalTo: view.topAnchor),
+            toolbar.heightAnchor.constraint(equalToConstant: 36),
+
+            row.leadingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: 10),
+            row.trailingAnchor.constraint(equalTo: toolbar.trailingAnchor, constant: -10),
+            row.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
+
+            panel.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            panel.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            panel.topAnchor.constraint(equalTo: toolbar.bottomAnchor),
+            panel.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+
             height
         ])
+
+        updateStatus("就绪")
     }
 
-    private func makeButton(_ title: String, action: Selector) -> UIButton {
+    private func makeButton(_ title: String, icon: String) -> UIButton {
         let b = UIButton(type: .system)
-        b.setTitle(title, for: .normal)
+        b.setTitle(" " + title, for: .normal)
+        b.setImage(UIImage(systemName: icon), for: .normal)
         b.titleLabel?.font = .systemFont(ofSize: 12, weight: .medium)
-        b.backgroundColor = .tertiarySystemBackground
-        b.layer.cornerRadius = 6
-        b.addTarget(self, action: action, for: .touchUpInside)
-        b.heightAnchor.constraint(equalToConstant: 34).isActive = true
+        b.tintColor = .label
+        b.setContentHuggingPriority(.required, for: .horizontal)
         return b
     }
 
-    // MARK: - 状态展示
-
-    private func reloadStatus() {
-        let shared = GroupStore.effectiveDirectory?.isShared == true
-        let dir = GroupStore.effectiveDirectory?.url.path ?? "nil"
-        statusLabel.text = """
-        group: \(shared ? "共享 ✅" : "私有 ❌")  \(GroupStore.groupID)
-        dir: \(dir)
-        pid: \(ProcessInfo.processInfo.processIdentifier)
-        """
-        logLabel.text = lines.suffix(6).joined(separator: "\n")
-    }
-
-    private func log(_ event: String, _ detail: String) {
-        let line = "\(timeString()) \(event) \(detail)"
-        lines.append(line)
-        if lines.count > 40 { lines.removeFirst() }
-        GroupStore.append(PocLogEntry(source: "keyboard", event: event, detail: detail))
-        DispatchQueue.main.async { self.reloadStatus() }
-    }
-
-    private func timeString() -> String {
-        let f = DateFormatter()
-        f.dateFormat = "HH:mm:ss"
-        return f.string(from: Date())
-    }
-
-    private func flash(_ text: String) {
-        let original = statusLabel.text
+    private func updateStatus(_ text: String) {
         statusLabel.text = text
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { self.statusLabel.text = original }
+    }
+
+    @objc private func showPanel() {
+        panel.isHidden.toggle()
+        panel.reload()
+    }
+
+    @objc private func goNext() {
+        advanceToNextInputMode()
     }
 }

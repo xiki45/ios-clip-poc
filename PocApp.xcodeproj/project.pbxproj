@@ -7,6 +7,13 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		AA00000000000000000000DE /* ClipPanelView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000DD /* ClipPanelView.swift */; };
+		AA00000000000000000000D6 /* ClipModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000D3 /* ClipModel.swift */; };
+		AA00000000000000000000D7 /* Rewriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000D4 /* Rewriter.swift */; };
+		AA00000000000000000000D8 /* Tokenizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000D5 /* Tokenizer.swift */; };
+		AA00000000000000000000DA /* ClipModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000D3 /* ClipModel.swift */; };
+		AA00000000000000000000DB /* Rewriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000D4 /* Rewriter.swift */; };
+		AA00000000000000000000DC /* Tokenizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000D5 /* Tokenizer.swift */; };
 		AA00000000000000000000B1 /* GroupStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F1 /* GroupStore.swift */; };
 		AA00000000000000000000B2 /* GroupStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F1 /* GroupStore.swift */; };
 		AA00000000000000000000B3 /* Diagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F2 /* Diagnostics.swift */; };
@@ -43,6 +50,10 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		AA00000000000000000000DD /* ClipPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClipPanelView.swift; sourceTree = "<group>"; };
+		AA00000000000000000000D3 /* ClipModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClipModel.swift; sourceTree = "<group>"; };
+		AA00000000000000000000D4 /* Rewriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Rewriter.swift; sourceTree = "<group>"; };
+		AA00000000000000000000D5 /* Tokenizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Tokenizer.swift; sourceTree = "<group>"; };
 		AA00000000000000000000F1 /* GroupStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GroupStore.swift; sourceTree = "<group>"; };
 		AA00000000000000000000F2 /* Diagnostics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Diagnostics.swift; sourceTree = "<group>"; };
 		AA00000000000000000000F3 /* PocApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PocApp.swift; sourceTree = "<group>"; };
@@ -92,6 +103,9 @@
 			children = (
 				AA00000000000000000000F1 /* GroupStore.swift */,
 				AA00000000000000000000F2 /* Diagnostics.swift */,
+				AA00000000000000000000D3 /* ClipModel.swift */,
+				AA00000000000000000000D4 /* Rewriter.swift */,
+				AA00000000000000000000D5 /* Tokenizer.swift */,
 			);
 			path = Shared;
 			sourceTree = "<group>";
@@ -230,6 +244,9 @@
 				AA00000000000000000000B5 /* PocApp.swift in Sources */,
 				AA00000000000000000000B6 /* AppModel.swift in Sources */,
 				AA00000000000000000000B7 /* ContentView.swift in Sources */,
+				AA00000000000000000000D6 /* ClipModel.swift in Sources */,
+				AA00000000000000000000D7 /* Rewriter.swift in Sources */,
+				AA00000000000000000000D8 /* Tokenizer.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -240,6 +257,10 @@
 				AA00000000000000000000B2 /* GroupStore.swift in Sources */,
 				AA00000000000000000000B4 /* Diagnostics.swift in Sources */,
 				AA00000000000000000000B8 /* KeyboardViewController.swift in Sources */,
+				AA00000000000000000000DE /* ClipPanelView.swift in Sources */,
+				AA00000000000000000000DA /* ClipModel.swift in Sources */,
+				AA00000000000000000000DB /* Rewriter.swift in Sources */,
+				AA00000000000000000000DC /* Tokenizer.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
