@@ -12,12 +12,10 @@
 
 ## 0. 已构建好的产物（CI 产出，可直接装）
 
-| 文件 | 说明 | 建议 |
-|---|---|---|
-| `PocApp-codesign.ipa` | 用 `codesign --force --sign - --entitlements` 签名，entitlements 为标准 blob，`codesign --verify` 通过 | **先试这个** |
-| `PocApp-ldid.ipa` | 用 `ldid -S` 把 entitlements 写入 `__TEXT` 段（TrollStore 传统做法） | codesign 版装不上时用这个 |
+`PocApp.ipa` —— 用 `codesign --force --sign - --entitlements` 签名，entitlements 为标准 blob，
+CI 里会用 `codesign -d --entitlements` 回读并断言 `group.com.ouo.clipboardpoc` 存在，缺失即构建失败。
 
-两份都已确认包含 `group.com.ouo.clipboardpoc`，且 `PlugIns/ClipKeyboard.appex` 完整嵌入。
+产物已确认包含 `PlugIns/ClipKeyboard.appex`。
 
 构建记录：<https://github.com/xiki45/ios-clip-poc/actions>
 

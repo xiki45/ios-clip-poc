@@ -60,7 +60,7 @@ git push -u origin main
 | 工具链信息 | 打印 Xcode 版本、iOS SDK 版本、target 列表（排错第一现场） |
 | 编译（未签名） | `xcodebuild -target PocApp -sdk iphoneos CODE_SIGNING_ALLOWED=NO` |
 | 检查产物结构 | 断言 `PocApp.app/PlugIns/ClipKeyboard.appex` 存在，并打印目录树 |
-| 写入 entitlements | `ldid -S` 分别签主程序和扩展，并回读打印 |
+| 签名并打包 | `codesign --force --sign -` 先签 appex 再签 App，回读 entitlements 并断言 group id 存在 |
 | 打包 IPA | `Payload/PocApp.app` → `PocApp.ipa` |
 | 上传 IPA | artifact `PocApp-ipa`（保留 14 天） |
 | 失败时上传日志 | artifact `build-log`，含完整 xcodebuild 输出 |

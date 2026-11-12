@@ -51,73 +51,42 @@ jobs:
           find "$EXT" -maxdepth 2 | sort
           test -f "$EXT/ClipKeyboard" || { echo "::error::缺少扩展可执行文件"; exit 1; }
 
-      - name: 写入 entitlements（产出 ldid 版 + codesign 版）
+      - name: 签名并打包（codesign）
         run: |
           set -euo pipefail
           SRC="build/Release-iphoneos/PocApp.app"
           APP_ENT="$PWD/PocApp/PocApp.entitlements"
           EXT_ENT="$PWD/ClipKeyboard/ClipKeyboard.entitlements"
+          OUT="$PWD/PocApp.ipa"
 
-          pack() {
-            local dir="$1" out="$2"
-            local abs_dir="$PWD/$dir"
-            local abs_out="$PWD/$out"
-            rm -rf "$abs_dir/Payload"
-            mkdir -p "$abs_dir/Payload"
-            cp -R "$abs_dir/PocApp.app" "$abs_dir/Payload/PocApp.app"
-            ( cd "$abs_dir" && zip -qry "$abs_out" Payload && rm -rf Payload )
-          }
+          rm -rf build/stage && mkdir -p build/stage
+          cp -R "$SRC" build/stage/PocApp.app
+          APP=build/stage/PocApp.app
 
-          # ── A. ldid 版（TrollStore 传统做法，entitlements 写入 __TEXT 段）──
-          rm -rf build/stage-ldid && mkdir -p build/stage-ldid
-          cp -R "$SRC" build/stage-ldid/PocApp.app
-          APP_L=build/stage-ldid/PocApp.app
-          brew install ldid >/dev/null 2>&1 || true
-          if command -v ldid >/dev/null 2>&1; then
-            ldid -S"$EXT_ENT" "$APP_L/PlugIns/ClipKeyboard.appex/ClipKeyboard"
-            ldid -S"$APP_ENT" "$APP_L/PocApp"
-            ldid -e "$APP_L/PocApp" > build/check-app-ldid.plist || true
-            ldid -e "$APP_L/PlugIns/ClipKeyboard.appex/ClipKeyboard" > build/check-ext-ldid.plist || true
-            pack build/stage-ldid PocApp-ldid.ipa
-          else
-            echo "::warning::ldid 不可用，跳过 ldid 版"
-          fi
+          # 嵌套签名：先 appex，再 App，顺序不能反
+          codesign --force --sign - --entitlements "$EXT_ENT" "$APP/PlugIns/ClipKeyboard.appex"
+          codesign --force --sign - --entitlements "$APP_ENT" "$APP"
 
-          # ── B. codesign 版（标准 blob，可被 codesign 验证）──
-          rm -rf build/stage-cs && mkdir -p build/stage-cs
-          cp -R "$SRC" build/stage-cs/PocApp.app
-          APP_C=build/stage-cs/PocApp.app
-          codesign --force --sign - --entitlements "$EXT_ENT" "$APP_C/PlugIns/ClipKeyboard.appex"
-          codesign --force --sign - --entitlements "$APP_ENT" "$APP_C"
-          pack build/stage-cs PocApp-codesign.ipa
+          codesign -d --entitlements :- "$APP/PocApp" 2>/dev/null > build/check-app-entitlements.plist || true
+          codesign -d --entitlements :- "$APP/PlugIns/ClipKeyboard.appex" 2>/dev/null > build/check-ext-entitlements.plist || true
 
-          echo "---- 回读 codesign 版 ----"
-          codesign -d --entitlements :- "$APP_C/PocApp" 2>/dev/null | tee build/check-app-codesign.plist || true
-          codesign -d --entitlements :- "$APP_C/PlugIns/ClipKeyboard.appex" 2>/dev/null | tee build/check-ext-codesign.plist || true
+          echo "---- App ----";   cat build/check-app-entitlements.plist || true
+          echo "---- Ext ----";   cat build/check-ext-entitlements.plist || true
+          grep -q "clipboardpoc" build/check-app-entitlements.plist || { echo "::error::主程序 entitlements 缺失"; exit 1; }
+          grep -q "clipboardpoc" build/check-ext-entitlements.plist || { echo "::error::扩展 entitlements 缺失"; exit 1; }
 
-          grep -q "clipboardpoc" build/check-app-codesign.plist   || { echo "::error::主程序 entitlements 缺失"; exit 1; }
-          grep -q "clipboardpoc" build/check-ext-codesign.plist   || { echo "::error::扩展 entitlements 缺失"; exit 1; }
-
-          ls -lh *.ipa
-
-      - name: 产出未签名版（交给 TrollStore 全权签名）
-        run: |
-          set -euo pipefail
-          rm -rf build/stage-raw && mkdir -p build/stage-raw/Payload
-          cp -R build/Release-iphoneos/PocApp.app build/stage-raw/Payload/PocApp.app
-          ( cd build/stage-raw && zip -qry "$OLDPWD/PocApp-raw.ipa" Payload && rm -rf Payload )
-          ls -lh PocApp-raw.ipa
-          echo "---- raw 版签名状态（应为 no signature）----"
-          codesign -dv build/stage-raw/Payload/PocApp.app/PocApp 2>&1 | head -3 || true
+          mkdir -p build/stage/Payload
+          cp -R "$APP" build/stage/Payload/PocApp.app
+          ( cd build/stage && zip -qry "$OUT" Payload && rm -rf Payload )
+          ls -lh PocApp.ipa
+          unzip -l PocApp.ipa | head -15
 
       - name: 上传 IPA
         uses: actions/upload-artifact@v4
         with:
           name: PocApp-ipa
           path: |
-            PocApp-codesign.ipa
-            PocApp-ldid.ipa
-            PocApp-raw.ipa
+            PocApp.ipa
             build/check-*.plist
           retention-days: 14
 
