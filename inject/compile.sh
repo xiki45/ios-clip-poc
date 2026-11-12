@@ -15,6 +15,7 @@ xcrun --sdk iphoneos clang \
     -isysroot "$SDK" \
     -framework UIKit \
     -framework Foundation \
+    -framework CoreGraphics \
     -install_name "@rpath/WeTypeInject.dylib" \
     -o WeTypeInject.dylib \
     WeTypeInject.m
