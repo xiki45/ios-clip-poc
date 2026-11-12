@@ -71,7 +71,7 @@ static BOOL WTInsert(UIViewController *vc, NSString *text, UIButton *btn) {
         return NO;
     }
     id proxy = [(UIInputViewController *)vc textDocumentProxy];
-    WTSetState(btn, @"②", WTBlue);
+    WTSetState(btn, @"②", WTBlue());
     WTLog(@"proxy = %@  responds insertText=%d", proxy,
           [proxy respondsToSelector:@selector(insertText:)]);
     if (![proxy respondsToSelector:@selector(insertText:)]) return NO;
@@ -81,7 +81,7 @@ static BOOL WTInsert(UIViewController *vc, NSString *text, UIButton *btn) {
         before = [proxy documentContextBeforeInput];
     }
     [proxy insertText:text];
-    WTSetState(btn, @"③", WTBlue);
+    WTSetState(btn, @"③", WTBlue());
 
     NSString *after = nil;
     if ([proxy respondsToSelector:@selector(documentContextBeforeInput)]) {
@@ -109,7 +109,7 @@ static BOOL WTInsert(UIViewController *vc, NSString *text, UIButton *btn) {
     if (_fired) return;
     _fired = YES;
     WTLog(@"触发(%@)", reason);
-    WTSetState(self.button, @"①", WTOrange);
+    WTSetState(self.button, @"①", WTOrange());
     BOOL ok = WTInsert(self.host, @"INJECT-OK ", self.button);
     WTSetState(self.button, ok ? @"✓" : @"✗", ok ? WTGreen() : WTRed());
     // 1 秒后复位，方便反复试
@@ -122,7 +122,7 @@ static BOOL WTInsert(UIViewController *vc, NSString *text, UIButton *btn) {
 
 - (void)onDown:(id)sender {
     // 先亮橙：说明 touch 确实落到了按钮上
-    WTSetState(self.button, @"①", WTOrange);
+    WTSetState(self.button, @"①", WTOrange());
     WTLog(@"touchDown");
     _fired = NO;
     NSUInteger token = ++_token;
