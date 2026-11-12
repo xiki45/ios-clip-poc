@@ -1,12 +1,18 @@
 //
-//  WeTypeInject.m  ·  stage-2 v3（带自诊断）
+//  WeTypeInject.m  ·  v5
 //
-//  这一版同时回答两个问题：
-//    Q1 tap 到底有没有到按钮上   → 按钮标题会变（①→②→③→✓/✗）
-//    Q2 insertText 到底有没有生效 → 键盘弹出来时会自动插一段 AUTO-OK
+//  v4 已经证明两件事：
+//    1) insertText 通路是通的（AUTO-OK 插进了输入框，按钮显示 auto✓）
+//    2) 按钮能创建、能更新标题
+//  唯一没解决的：点击命中不到按钮。
 //
-//  只要看到 AUTO-OK，就说明 insertText 通路是好的，问题只在按钮；
-//  如果 AUTO-OK 也不出现，说明 proxy 这条路在微信输入法里不通。
+//  v5 换成不依赖 hitTest 的触发方式：
+//    在 window 上挂一个 UITapGestureRecognizer（cancelsTouchesInView=NO），
+//    点击位置落在按钮 frame 内就触发。window 级手势能看到所有触摸，
+//    即使按钮被上层视图或手势吃掉也一样。
+//    按钮自己的 target-action 和 touchDown 兜底都保留，三条路谁先到算谁。
+//
+//  功能也从「插固定字符串」升级成「插当前剪贴板内容」，点一次就有真实用途。
 //
 
 #import <UIKit/UIKit.h>
@@ -40,64 +46,63 @@ static void WTLog(NSString *fmt, ...) {
         NSLog(@"[wtinject] %@", msg);
         FILE *fp = fopen(WTLogPath().UTF8String, "a");
         if (fp) { fputs(line.UTF8String, fp); fclose(fp); }
-    } @catch (NSException *e) {
-        NSLog(@"[wtinject] log fail: %@", e);
-    }
+    } @catch (NSException *e) { NSLog(@"[wtinject] log fail: %@", e); }
 }
 
-#pragma mark - 按钮（自带状态机，用标题显示进度）
+#pragma mark - 状态与颜色
 
-static const void *kButtonKey = &kButtonKey;
+static const void *kButtonKey  = &kButtonKey;
 static const void *kHandlerKey = &kHandlerKey;
-static const void *kBubbleKey = &kBubbleKey;
+static const void *kGestureKey = &kGestureKey;
 static const void *kAutoDoneKey = &kAutoDoneKey;
-
-static void WTSetState(UIButton *btn, NSString *title, UIColor *bg) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [btn setTitle:title forState:UIControlStateNormal];
-        btn.backgroundColor = bg;
-    });
-}
 
 static UIColor *WTGreen(void) { return [UIColor colorWithRed:0.00 green:0.62 blue:0.42 alpha:1]; }
 static UIColor *WTOrange(void){ return [UIColor colorWithRed:0.95 green:0.52 blue:0.10 alpha:1]; }
 static UIColor *WTRed(void)   { return [UIColor colorWithRed:0.85 green:0.20 blue:0.20 alpha:1]; }
 static UIColor *WTBlue(void)  { return [UIColor colorWithRed:0.10 green:0.45 blue:0.90 alpha:1]; }
 
-/// 用代理插字，并回读文档确认是否真的进去了
+static void WTSetState(UIButton *btn, NSString *title, UIColor *bg) {
+    if (!btn) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [btn setTitle:title forState:UIControlStateNormal];
+        btn.backgroundColor = bg;
+    });
+}
+
+#pragma mark - 插入
+
+static NSString *WTPayload(void) {
+    UIPasteboard *pb = [UIPasteboard generalPasteboard];
+    NSString *s = pb.string;
+    if (s.length == 0) return @"(剪贴板为空)";
+    if (s.length > 1000) s = [s substringToIndex:1000];
+    return s;
+}
+
 static BOOL WTInsert(UIViewController *vc, NSString *text, UIButton *btn) {
-    if (![vc isKindOfClass:[UIInputViewController class]]) {
-        WTLog(@"vc 不是 UIInputViewController");
+    if (![vc isKindOfClass:[UIInputViewController class]]) return NO;
+    id proxy = [(UIInputViewController *)vc textDocumentProxy];
+    if (![proxy respondsToSelector:@selector(insertText:)]) {
+        WTLog(@"proxy 不支持 insertText");
         return NO;
     }
-    id proxy = [(UIInputViewController *)vc textDocumentProxy];
-    WTSetState(btn, @"②", WTBlue());
-    WTLog(@"proxy = %@  responds insertText=%d", proxy,
-          [proxy respondsToSelector:@selector(insertText:)]);
-    if (![proxy respondsToSelector:@selector(insertText:)]) return NO;
-
-    NSString *before = nil;
-    if ([proxy respondsToSelector:@selector(documentContextBeforeInput)]) {
-        before = [proxy documentContextBeforeInput];
-    }
+    NSString *before = [proxy respondsToSelector:@selector(documentContextBeforeInput)]
+                       ? [proxy documentContextBeforeInput] : nil;
     [proxy insertText:text];
-    WTSetState(btn, @"③", WTBlue());
-
-    NSString *after = nil;
-    if ([proxy respondsToSelector:@selector(documentContextBeforeInput)]) {
-        after = [proxy documentContextBeforeInput];
-    }
+    NSString *after = [proxy respondsToSelector:@selector(documentContextBeforeInput)]
+                      ? [proxy documentContextBeforeInput] : nil;
     BOOL ok = (after.length > before.length) || (before == nil && after != nil);
-    WTLog(@"插入 \"%@\"  前后长度 %lu -> %lu  ok=%d",
-          text, (unsigned long)before.length, (unsigned long)after.length, ok);
+    WTLog(@"插入 %lu 字，前后 %lu→%lu，ok=%d", (unsigned long)text.length,
+          (unsigned long)before.length, (unsigned long)after.length, ok);
     return ok;
 }
 
 #pragma mark - 点击处理
 
-@interface WTTapHandler : NSObject
+@interface WTTapHandler : NSObject <UIGestureRecognizerDelegate>
 @property (nonatomic, weak) UIViewController *host;
 @property (nonatomic, weak) UIButton *button;
+@property (nonatomic, weak) UIView *gestureHost;
 @end
 
 @implementation WTTapHandler {
@@ -105,45 +110,58 @@ static BOOL WTInsert(UIViewController *vc, NSString *text, UIButton *btn) {
     NSUInteger _token;
 }
 
-- (void)runIfNeeded:(NSString *)reason {
+- (void)fire:(NSString *)reason {
     if (_fired) return;
     _fired = YES;
     WTLog(@"触发(%@)", reason);
     WTSetState(self.button, @"①", WTOrange());
-    BOOL ok = WTInsert(self.host, @"INJECT-OK ", self.button);
+
+    BOOL ok = WTInsert(self.host, WTPayload(), self.button);
     WTSetState(self.button, ok ? @"✓" : @"✗", ok ? WTGreen() : WTRed());
-    // 1 秒后复位，方便反复试
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         self->_fired = NO;
-        WTSetState(self.button, @"注入3", WTGreen());
+        WTSetState(self.button, @"粘贴", WTGreen());
     });
 }
 
 - (void)onDown:(id)sender {
-    // 先亮橙：说明 touch 确实落到了按钮上
     WTSetState(self.button, @"①", WTOrange());
     WTLog(@"touchDown");
     _fired = NO;
     NSUInteger token = ++_token;
-    // 兜底：如果上层手势 recognizer 把 tap cancel 掉，touchUpInside 不会来，
-    // 0.35s 后自己触发一次
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        if (token == self->_token) [self runIfNeeded:@"touchDown兜底"];
+        if (token == self->_token) [self fire:@"touchDown兜底"];
     });
 }
 
 - (void)onTap:(id)sender {
     WTLog(@"touchUpInside");
-    [self runIfNeeded:@"touchUpInside"];
+    [self fire:@"touchUpInside"];
+}
+
+/// window 级手势：不依赖 hitTest，按钮被盖住也能收到
+- (void)onGesture:(UITapGestureRecognizer *)g {
+    UIButton *btn = self.button;
+    UIView *host = g.view;
+    if (!btn || !host) return;
+    CGPoint p = [g locationInView:host];
+    CGRect f = [btn.superview convertRect:btn.frame toView:host];
+    BOOL hit = CGRectContainsPoint(CGRectInset(f, -6, -6), p);
+    WTLog(@"手势 tap %@ 按钮%@", NSStringFromCGPoint(p), hit ? @"命中" : @"未命中");
+    if (hit) [self fire:@"gesture"];
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g
+    shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other {
+    return YES;
 }
 @end
 
-#pragma mark - 按钮安装
+#pragma mark - 安装
 
-/// 优先挂到 window：键盘扩展里 vc.view 之上常被后加的全屏视图盖住，
-/// 挂在 window 上既不会被盖，也不影响命中测试。
 static UIView *WTContainer(UIViewController *vc) {
     return vc.view.window ?: vc.view;
 }
@@ -157,23 +175,46 @@ static void WTLayoutButton(UIViewController *vc) {
         WTLog(@"按钮挂到 %@", NSStringFromClass([container class]));
     }
     CGRect anchor = [vc.view convertRect:vc.view.bounds toView:container];
-    CGFloat x = anchor.origin.x + anchor.size.width - 52;
-    CGFloat y = anchor.origin.y + 5;
-    btn.frame = CGRectMake(x, y, 46, 30);
+    btn.frame = CGRectMake(anchor.origin.x + anchor.size.width - 56,
+                           anchor.origin.y + 5, 50, 30);
+    [btn.superview bringSubviewToFront:btn];
+}
+
+static void WTInstallGesture(UIViewController *vc, UIButton *btn) {
+    UIView *container = WTContainer(vc);
+    if (objc_getAssociatedObject(container, kGestureKey)) return;
+
+    WTTapHandler *handler = [WTTapHandler new];
+    handler.host = vc;
+    handler.button = btn;
+    handler.gestureHost = container;
+
+    UITapGestureRecognizer *g = [[UITapGestureRecognizer alloc] initWithTarget:handler
+                                                                       action:@selector(onGesture:)];
+    g.delegate = handler;
+    g.cancelsTouchesInView = NO;
+    g.delaysTouchesBegan = NO;
+    g.delaysTouchesEnded = NO;
+    [container addGestureRecognizer:g];
+    objc_setAssociatedObject(container, kGestureKey, handler, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    WTLog(@"手势已挂到 %@", NSStringFromClass([container class]));
 }
 
 static void WTInstallButton(UIViewController *vc) {
-    if (objc_getAssociatedObject(vc, kButtonKey)) { WTLayoutButton(vc); return; }
+    UIButton *btn = objc_getAssociatedObject(vc, kButtonKey);
+    if (btn) {
+        WTLayoutButton(vc);
+        WTInstallGesture(vc, btn);
+        return;
+    }
 
-    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [btn setTitle:@"注入3" forState:UIControlStateNormal];
-    btn.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
+    btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [btn setTitle:@"粘贴" forState:UIControlStateNormal];
+    btn.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
     [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     btn.backgroundColor = WTGreen();
     btn.layer.cornerRadius = 8;
     btn.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
-    // 保证按钮在最上层，不被后加的视图盖住
-    btn.layer.zPosition = 10000;
 
     WTTapHandler *handler = [WTTapHandler new];
     handler.host = vc;
@@ -184,8 +225,9 @@ static void WTInstallButton(UIViewController *vc) {
 
     objc_setAssociatedObject(vc, kButtonKey, btn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     WTLayoutButton(vc);
-    WTLog(@"按钮已挂上 window=%@ bounds=%@",
-          vc.view.window ? @"yes" : @"nil", NSStringFromCGRect(vc.view.bounds));
+    WTInstallGesture(vc, btn);
+    WTLog(@"按钮已装 bounds=%@ window=%@",
+          NSStringFromCGRect(vc.view.bounds), vc.view.window ? @"yes" : @"nil");
 }
 
 #pragma mark - hook
@@ -196,10 +238,8 @@ static void (*orig_viewDidAppear)(id, SEL, BOOL);
 
 static void wt_viewDidLoad(id self, SEL _cmd) {
     orig_viewDidLoad(self, _cmd);
-    @try {
-        WTLog(@"viewDidLoad");
-        WTInstallButton((UIViewController *)self);
-    } @catch (NSException *e) { WTLog(@"viewDidLoad 异常: %@", e); }
+    @try { WTLog(@"viewDidLoad"); WTInstallButton((UIViewController *)self); }
+    @catch (NSException *e) { WTLog(@"viewDidLoad 异常: %@", e); }
 }
 
 static void wt_viewDidLayoutSubviews(id self, SEL _cmd) {
@@ -209,7 +249,7 @@ static void wt_viewDidLayoutSubviews(id self, SEL _cmd) {
         UIButton *btn = objc_getAssociatedObject(vc, kButtonKey);
         if (!btn) return;
         WTLayoutButton(vc);
-        [btn.superview bringSubviewToFront:btn];
+        WTInstallGesture(vc, btn);
     } @catch (NSException *e) { WTLog(@"layout 异常: %@", e); }
 }
 
@@ -217,16 +257,12 @@ static void wt_viewDidAppear(id self, SEL _cmd, BOOL animated) {
     orig_viewDidAppear(self, _cmd, animated);
     @try {
         UIViewController *vc = (UIViewController *)self;
-        NSNumber *done = objc_getAssociatedObject(vc, kAutoDoneKey);
-        if (done.boolValue) return;
+        if ([objc_getAssociatedObject(vc, kAutoDoneKey) boolValue]) return;
         objc_setAssociatedObject(vc, kAutoDoneKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-        // 自动插一段：不用点按钮就能验证 insertText 通路
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             UIButton *btn = objc_getAssociatedObject(vc, kButtonKey);
             @try {
-                WTLog(@"自动插入测试");
                 BOOL ok = WTInsert(vc, @"AUTO-OK ", btn);
                 WTSetState(btn, ok ? @"auto✓" : @"auto✗", ok ? WTGreen() : WTRed());
             } @catch (NSException *e) { WTLog(@"auto 异常: %@", e); }
@@ -243,8 +279,7 @@ static void WTSwizzle(Class cls, SEL sel, void *replacement, void **original) {
 }
 
 static void WTInitInner(void) {
-    WTLog(@"===== dylib v3 loaded =====");
-    WTLog(@"log: %@", WTLogPath());
+    WTLog(@"===== dylib v5 loaded =====");
     Class cls = objc_getClass("WBInputViewController");
     if (!cls) { WTLog(@"!! 找不到 WBInputViewController"); return; }
     WTSwizzle(cls, @selector(viewDidLoad), (void *)wt_viewDidLoad, (void **)&orig_viewDidLoad);
