@@ -74,11 +74,35 @@ for text in [plain, "{\"a\":1}", "b\na\nb", "aGVsbG8=", "a%20b", "  空格  "] {
 
 print("== Tokenizer ==")
 let t1 = Tokenizer.tokens("支付回调日志")
-check(t1.contains("支付") && t1.contains("回调"), "中文 2-gram", "\(t1)")
+check(t1 == ["支付", "回调", "日志"], "中文 2-gram 不重叠", "\(t1)")
 let t2 = Tokenizer.tokens("getUserName 你好")
-check(t2.contains("getusername"), "英文小写化", "\(t2)")
+check(t2.contains("get") && t2.contains("user") && t2.contains("name"), "驼峰拆分", "\(t2)")
 check(Tokenizer.matches("支付接口回调失败", query: "支付 回调"), "多 token AND")
 check(!Tokenizer.matches("支付接口失败", query: "支付 回调"), "缺 token 不匹配")
+
+print("== v11 分词：块感知 ==")
+let seg = Tokenizer.tokens("文本 https://example.com/a?b=1 支付回调")
+check(seg.contains("https://example.com/a?b=1"), "URL 作为整体一个 token", "\(seg)")
+check(seg.contains("文本") && seg.contains("支付") && seg.contains("回调"), "URL 前后文本正常切", "\(seg)")
+check(!seg.contains("http") && !seg.contains("com"), "URL 不再被拆碎", "\(seg)")
+
+let seg2 = Tokenizer.tokens("联系 a@b.com 或 2026-11-13 或 Infoway 版本 v1.2")
+check(seg2.contains("a@b.com"), "邮箱整体保留", "\(seg2)")
+check(seg2.contains("2026-11-13"), "日期整体保留", "\(seg2)")
+check(seg2.contains("infoway"), "英文单词整词小写", "\(seg2)")
+check(!seg2.contains("https"), "无链接时不产生伪 URL", "\(seg2)")
+
+let seg3 = Tokenizer.tokens("支付回调日")
+check(seg3 == ["支付", "回调", "日"], "奇数长度尾字保留", "\(seg3)")
+
+let seg4 = Tokenizer.tokens("见 https://infoway.com/x.")
+check(seg4.contains("https://infoway.com/x"), "URL 尾部句点剥离", "\(seg4)")
+
+let seg5 = Tokenizer.segments("https://www.zhihu.com/question/123?a=1#c")
+check(seg5 == ["https://www.zhihu.com/question/123?a=1#c"], "带参数与锚点的完整 URL", "\(seg5)")
+
+check(Tokenizer.matches("见 https://example.com/x", query: "example.com"), "域名可被搜索到")
+check(Tokenizer.matches("getUserName 接口", query: "user"), "驼峰内单词可被搜索到")
 
 print("== ClipStore ==")
 let dir = FileManager.default.temporaryDirectory.appendingPathComponent("cliptest-\(UUID().uuidString)")

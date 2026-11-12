@@ -1,9 +1,12 @@
 //
 //  ClipPanelView.swift
-//  键盘内的剪贴板面板：搜索 + 列表 + 点选插入 + 常驻重写按钮（长按也保留）
+//  键盘内的剪贴板面板：分类条 + 跟随输入过滤 + 列表 + 点选插入 + 常驻重写按钮
 //
-//  v10：重写从「长按猜」改成「每行右侧常驻 ✨ 按钮」，
-//       菜单只列真正会改变内容的算子（v9 对纯文本列了三个 no-op，看起来像没做）。
+//  v11：删掉搜不到东西的 UISearchBar。
+//  键盘扩展里 UISearchBar 拿不到焦点（扩展本身是键盘，唤不起系统键盘），
+//  所以「输入框打字搜索」在这条路上根本走不通。改成两条零输入过滤：
+//    1. 分类 chip：全部 / 置顶 / 链接 / JSON / 代码 / 今天 / 长文
+//    2. 跟随输入：读宿主输入框光标前的字当作过滤词（用户已经打好的字)
 //
 
 import UIKit
@@ -16,14 +19,19 @@ final class ClipPanelView: UIView {
     var onPin: ((ClipItem) -> Void)?
     var onDelete: ((ClipItem) -> Void)?
     var onClose: (() -> Void)?
+    var onClearQuery: (() -> Void)?
 
     // 数据
     private var store: ClipStore?
     private var items: [ClipItem] = []
     private var query: String = ""
+    private var chip: FilterChip = .all
 
     // UI
-    private let searchBar = UISearchBar()
+    private let filterBar = UIScrollView()
+    private let filterStack = UIStackView()
+    private let queryBar = UIView()
+    private let queryLabel = UILabel()
     private let tableView = UITableView(frame: .zero, style: .plain)
     private let emptyLabel = UILabel()
 
@@ -42,21 +50,64 @@ final class ClipPanelView: UIView {
         reload()
     }
 
+    /// 由键盘控制器传入「宿主输入框光标前的内容」当作过滤词
+    func setContextQuery(_ q: String?) {
+        let next = (q ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard next != query else { return }
+        query = next
+        updateQueryBar()
+        reload()
+    }
+
     func reload() {
-        let filtered = store?.search(query) ?? []
-        items = Array(filtered.prefix(80))
+        var list = store?.visibleItems(limit: 500) ?? []
+
+        switch chip {
+        case .all: break
+        case .pinned: list = list.filter { $0.pinned }
+        case .url:    list = list.filter { $0.kind == "url" }
+        case .json:   list = list.filter { $0.kind == "json" }
+        case .code:   list = list.filter { $0.kind == "code" }
+        case .today:  list = list.filter { Calendar.current.isDateInToday($0.updatedAt) }
+        case .long:   list = list.filter { $0.text.count > 200 }
+        }
+
+        if !query.isEmpty {
+            list = list.filter { Tokenizer.matches($0.text, query: query) }
+        }
+
+        items = Array(list.prefix(80))
         tableView.reloadData()
         emptyLabel.isHidden = !items.isEmpty
+        emptyLabel.text = emptyText()
+        updateQueryBar()
     }
 
     // MARK: - UI
 
     private func setupUI() {
-        searchBar.placeholder = "搜索剪贴板"
-        searchBar.searchBarStyle = .minimal
-        searchBar.delegate = self
-        searchBar.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(searchBar)
+        // 分类条
+        filterBar.showsHorizontalScrollIndicator = false
+        filterBar.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(filterBar)
+
+        filterStack.axis = .horizontal
+        filterStack.spacing = 6
+        filterStack.alignment = .center
+        filterStack.translatesAutoresizingMaskIntoConstraints = false
+        filterBar.addSubview(filterStack)
+
+        for c in FilterChip.allCases {
+            let b = UIButton(type: .system)
+            b.setTitle(c.title, for: .normal)
+            b.titleLabel?.font = .systemFont(ofSize: 11, weight: .medium)
+            b.tag = c.rawValue
+            b.layer.cornerRadius = 11
+            b.contentEdgeInsets = UIEdgeInsets(top: 3, left: 9, bottom: 3, right: 9)
+            b.addTarget(self, action: #selector(chipTapped(_:)), for: .touchUpInside)
+            filterStack.addArrangedSubview(b)
+        }
+        styleChips()
 
         let close = UIButton(type: .system)
         close.setTitle("收起", for: .normal)
@@ -65,6 +116,26 @@ final class ClipPanelView: UIView {
         close.translatesAutoresizingMaskIntoConstraints = false
         addSubview(close)
 
+        // 跟随输入提示条
+        queryBar.backgroundColor = .tertiarySystemBackground
+        queryBar.layer.cornerRadius = 8
+        queryBar.isHidden = true
+        queryBar.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(queryBar)
+
+        queryLabel.font = .systemFont(ofSize: 11)
+        queryLabel.textColor = .secondaryLabel
+        queryLabel.translatesAutoresizingMaskIntoConstraints = false
+        queryBar.addSubview(queryLabel)
+
+        let clear = UIButton(type: .system)
+        clear.setTitle("✕", for: .normal)
+        clear.titleLabel?.font = .systemFont(ofSize: 11, weight: .semibold)
+        clear.addTarget(self, action: #selector(clearQuery), for: .touchUpInside)
+        clear.translatesAutoresizingMaskIntoConstraints = false
+        queryBar.addSubview(clear)
+
+        // 列表
         tableView.dataSource = self
         tableView.delegate = self
         tableView.rowHeight = 56
@@ -74,7 +145,6 @@ final class ClipPanelView: UIView {
         tableView.register(ClipCell.self, forCellReuseIdentifier: "cell")
         addSubview(tableView)
 
-        emptyLabel.text = "还没有剪贴板记录\n复制点什么，再切回来"
         emptyLabel.numberOfLines = 2
         emptyLabel.textAlignment = .center
         emptyLabel.font = .systemFont(ofSize: 12)
@@ -83,18 +153,36 @@ final class ClipPanelView: UIView {
         addSubview(emptyLabel)
 
         NSLayoutConstraint.activate([
-            searchBar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
-            searchBar.trailingAnchor.constraint(equalTo: close.leadingAnchor, constant: -4),
-            searchBar.topAnchor.constraint(equalTo: topAnchor, constant: 2),
-            searchBar.heightAnchor.constraint(equalToConstant: 36),
+            filterBar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            filterBar.trailingAnchor.constraint(equalTo: close.leadingAnchor, constant: -4),
+            filterBar.topAnchor.constraint(equalTo: topAnchor, constant: 4),
+            filterBar.heightAnchor.constraint(equalToConstant: 26),
 
-            close.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            close.centerYAnchor.constraint(equalTo: searchBar.centerYAnchor),
+            filterStack.leadingAnchor.constraint(equalTo: filterBar.leadingAnchor),
+            filterStack.trailingAnchor.constraint(equalTo: filterBar.trailingAnchor),
+            filterStack.topAnchor.constraint(equalTo: filterBar.topAnchor),
+            filterStack.heightAnchor.constraint(equalTo: filterBar.heightAnchor),
+
+            close.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            close.centerYAnchor.constraint(equalTo: filterBar.centerYAnchor),
             close.widthAnchor.constraint(equalToConstant: 40),
+
+            queryBar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            queryBar.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            queryBar.topAnchor.constraint(equalTo: filterBar.bottomAnchor, constant: 4),
+            queryBar.heightAnchor.constraint(equalToConstant: 22),
+
+            queryLabel.leadingAnchor.constraint(equalTo: queryBar.leadingAnchor, constant: 8),
+            queryLabel.centerYAnchor.constraint(equalTo: queryBar.centerYAnchor),
+            queryLabel.trailingAnchor.constraint(lessThanOrEqualTo: queryBar.trailingAnchor, constant: -26),
+
+            clear.trailingAnchor.constraint(equalTo: queryBar.trailingAnchor, constant: -6),
+            clear.centerYAnchor.constraint(equalTo: queryBar.centerYAnchor),
+            clear.widthAnchor.constraint(equalToConstant: 20),
 
             tableView.leadingAnchor.constraint(equalTo: leadingAnchor),
             tableView.trailingAnchor.constraint(equalTo: trailingAnchor),
-            tableView.topAnchor.constraint(equalTo: searchBar.bottomAnchor, constant: 2),
+            tableView.topAnchor.constraint(equalTo: queryBar.bottomAnchor, constant: 2),
             tableView.bottomAnchor.constraint(equalTo: bottomAnchor),
 
             emptyLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
@@ -103,7 +191,45 @@ final class ClipPanelView: UIView {
         ])
     }
 
+    private func styleChips() {
+        for case let b as UIButton in filterStack.arrangedSubviews {
+            let active = b.tag == chip.rawValue
+            b.backgroundColor = active ? .systemBlue : .tertiarySystemBackground
+            b.setTitleColor(active ? .white : .label, for: .normal)
+        }
+    }
+
+    private func updateQueryBar() {
+        let show = !query.isEmpty
+        queryBar.isHidden = !show
+        guard show else { return }
+        let hit = items.count
+        queryLabel.text = "跟随输入：\(query)  ·  \(hit) 条"
+    }
+
+    private func emptyText() -> String {
+        if !query.isEmpty { return "没有匹配「\(query)」的记录" }
+        switch chip {
+        case .all: return "还没有剪贴板记录\n复制点什么，再切回来"
+        case .pinned: return "没有置顶条目\n长按一条可以置顶"
+        case .url: return "没有链接类记录"
+        case .json: return "没有 JSON 记录"
+        case .code: return "没有代码类记录"
+        case .today: return "今天还没有新记录"
+        case .long: return "没有 200 字以上的长文"
+        }
+    }
+
     @objc private func closeTapped() { onClose?() }
+
+    @objc private func clearQuery() { onClearQuery?() }
+
+    @objc private func chipTapped(_ sender: UIButton) {
+        guard let c = FilterChip(rawValue: sender.tag) else { return }
+        chip = c
+        styleChips()
+        reload()
+    }
 
     // MARK: - 重写菜单
 
@@ -111,7 +237,6 @@ final class ClipPanelView: UIView {
         let options = Rewriter.options(for: item.text)
         guard !options.isEmpty else { return nil }
 
-        // 自动识别出的「推荐」
         let recOps = Rewriter.candidates(for: item.text).map { $0.op }
         var recommended: [UIAction] = []
         for op in recOps {
@@ -137,7 +262,6 @@ final class ClipPanelView: UIView {
     }
 
     private func action(_ item: ClipItem, _ option: Rewriter.Option, icon: String) -> UIAction {
-        // 标题用「算子名」，副标题位置显示结果预览（iOS 14+ UIAction 无 subtitle，塞进标题尾部）
         let title = "\(option.title)  \(option.detail)"
         return UIAction(title: title, image: UIImage(systemName: icon)) { [weak self] _ in
             self?.onRewrite?(item, option.step)
@@ -163,6 +287,24 @@ final class ClipPanelView: UIView {
     }
 }
 
+// MARK: - 分类
+
+enum FilterChip: Int, CaseIterable {
+    case all = 0, pinned, url, json, code, today, long
+
+    var title: String {
+        switch self {
+        case .all: return "全部"
+        case .pinned: return "置顶"
+        case .url: return "链接"
+        case .json: return "JSON"
+        case .code: return "代码"
+        case .today: return "今天"
+        case .long: return "长文"
+        }
+    }
+}
+
 // MARK: - TableView
 
 extension ClipPanelView: UITableViewDataSource, UITableViewDelegate {
@@ -176,7 +318,6 @@ extension ClipPanelView: UITableViewDataSource, UITableViewDelegate {
         let item = items[indexPath.row]
         cell.configure(with: item, query: query)
 
-        // 常驻重写按钮：每行一个 UIMenu，点一下就出菜单，不用长按猜
         cell.rewriteButton.menu = menu(for: item)
         cell.rewriteButton.showsMenuAsPrimaryAction = true
         cell.rewriteButton.isEnabled = cell.rewriteButton.menu != nil
@@ -195,19 +336,6 @@ extension ClipPanelView: UITableViewDataSource, UITableViewDelegate {
         return UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { [weak self] _ in
             self?.rowMenu(for: item)
         }
-    }
-}
-
-// MARK: - 搜索
-
-extension ClipPanelView: UISearchBarDelegate {
-    func searchBar(_ searchBar: UISearchBar, textDidChange searchText: String) {
-        query = searchText
-        reload()
-    }
-
-    func searchBarSearchButtonClicked(_ searchBar: UISearchBar) {
-        searchBar.resignFirstResponder()
     }
 }
 

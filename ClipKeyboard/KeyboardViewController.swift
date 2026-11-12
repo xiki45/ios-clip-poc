@@ -1,9 +1,12 @@
 //
 //  KeyboardViewController.swift
-//  剪贴板键盘 v1：采集 + 面板 + 点选插入 + 规则重写
+//  剪贴板键盘：采集 + 分类面板 + 跟随输入过滤 + 点选插入 + 规则重写
 //
 //  采集时机：键盘可见期间轮询 changeCount（iOS 不允许后台读剪贴板，
 //  所以「打开键盘才采集」是这个平台上唯一可行的模式）。
+//
+//  过滤时机：键盘扩展无法在自身 UI 里调起系统键盘，所以「打字搜索」这条路走不通；
+//  改成读宿主输入框光标前的内容当过滤词——用户用别的键盘打好的字，切过来就能用。
 //
 
 import UIKit
@@ -14,6 +17,11 @@ final class KeyboardViewController: UIInputViewController {
     // 数据
     private var store: ClipStore?
     private var lastChangeCount = -1
+
+    // 跟随输入的过滤词
+    private var lastContextWord: String?
+    private var suppressedFor: String?
+    private var ignoreNextContextRefresh = false
 
     // UI
     private let panel = ClipPanelView()
@@ -44,11 +52,18 @@ final class KeyboardViewController: UIInputViewController {
             self?.panel.reload()
         }
         panel.onClose = { [weak self] in self?.advanceToNextInputMode() }
+        panel.onClearQuery = { [weak self] in
+            guard let self else { return }
+            self.suppressedFor = self.lastContextWord
+            self.panel.setContextQuery(nil)
+            self.updateStatus("已清除过滤")
+        }
     }
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         capture()
+        refreshContextQuery()
         startPolling()
     }
 
@@ -56,6 +71,16 @@ final class KeyboardViewController: UIInputViewController {
         super.viewWillDisappear(animated)
         pollTimer?.invalidate()
         pollTimer = nil
+    }
+
+    /// 宿主输入框内容变化（用户打字 / 光标移动）时被调用
+    override func textDidChange(_ textInput: UITextInput?) {
+        super.textDidChange(textInput)
+        if ignoreNextContextRefresh {
+            ignoreNextContextRefresh = false
+            return
+        }
+        refreshContextQuery()
     }
 
     // MARK: - 采集
@@ -77,9 +102,52 @@ final class KeyboardViewController: UIInputViewController {
         }
     }
 
+    // MARK: - 跟随输入的过滤词
+
+    private func refreshContextQuery() {
+        let word = contextWord()
+        lastContextWord = word
+
+        // 用户点过 ✕：只要光标前的词没变，就别再自动填回去
+        if let s = suppressedFor {
+            if s == word {
+                panel.setContextQuery(nil)
+                return
+            }
+            suppressedFor = nil
+        }
+
+        panel.setContextQuery(word)
+    }
+
+    /// 取宿主输入框「光标前最后一个词」，太长就截尾
+    private func contextWord() -> String? {
+        guard let ctx = textDocumentProxy.documentContextBeforeInput, !ctx.isEmpty else { return nil }
+        let stop = CharacterSet.whitespacesAndNewlines
+            .union(.punctuationCharacters)
+            .union(.symbols)
+
+        var chars = Array(ctx)
+        var end = chars.count
+        while end > 0, let u = chars[end - 1].unicodeScalars.first, stop.contains(u) { end -= 1 }
+        var start = end
+        while start > 0, let u = chars[start - 1].unicodeScalars.first, !stop.contains(u) { start -= 1 }
+        guard end > start else { return nil }
+
+        var word = String(chars[start..<end])
+        if word.count > 8 { word = String(word.suffix(8)) }
+
+        // 单字符只有中文值得拿来过滤，单字母会命中一切
+        if word.count == 1 {
+            guard let c = word.first, Tokenizer.isCJK(c) else { return nil }
+        }
+        return word
+    }
+
     // MARK: - 动作
 
     private func insert(_ item: ClipItem) {
+        ignoreNextContextRefresh = true
         textDocumentProxy.insertText(item.text)
         updateStatus("已插入 \(item.text.count) 字")
     }
@@ -91,6 +159,7 @@ final class KeyboardViewController: UIInputViewController {
             updateStatus("\(step.op.displayName)失败：\(result.error ?? "未知原因")")
             return
         }
+        ignoreNextContextRefresh = true
         textDocumentProxy.insertText(result.output)
         // 重写结果存一条，便于二次使用（同内容会命中去重，只更新时间戳）
         store?.upsert(result.output, source: "rewrite")
@@ -129,7 +198,7 @@ final class KeyboardViewController: UIInputViewController {
         panel.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(panel)
 
-        let height = view.heightAnchor.constraint(equalToConstant: 268)
+        let height = view.heightAnchor.constraint(equalToConstant: 296)
         height.priority = .defaultHigh
 
         NSLayoutConstraint.activate([
