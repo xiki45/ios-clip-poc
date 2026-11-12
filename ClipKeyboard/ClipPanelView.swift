@@ -1,6 +1,9 @@
 //
 //  ClipPanelView.swift
-//  键盘内的剪贴板面板：搜索 + 列表 + 点选插入 + 长按菜单（规则/置顶/删除）
+//  键盘内的剪贴板面板：搜索 + 列表 + 点选插入 + 常驻重写按钮（长按也保留）
+//
+//  v10：重写从「长按猜」改成「每行右侧常驻 ✨ 按钮」，
+//       菜单只列真正会改变内容的算子（v9 对纯文本列了三个 no-op，看起来像没做）。
 //
 
 import UIKit
@@ -64,7 +67,7 @@ final class ClipPanelView: UIView {
 
         tableView.dataSource = self
         tableView.delegate = self
-        tableView.rowHeight = 54
+        tableView.rowHeight = 56
         tableView.separatorInset = UIEdgeInsets(top: 0, left: 12, bottom: 0, right: 12)
         tableView.backgroundColor = .clear
         tableView.translatesAutoresizingMaskIntoConstraints = false
@@ -102,30 +105,46 @@ final class ClipPanelView: UIView {
 
     @objc private func closeTapped() { onClose?() }
 
-    // MARK: - 规则菜单
+    // MARK: - 重写菜单
 
-    private func menu(for item: ClipItem) -> UIMenu {
-        var actions: [UIAction] = []
+    func menu(for item: ClipItem) -> UIMenu? {
+        let options = Rewriter.options(for: item.text)
+        guard !options.isEmpty else { return nil }
 
-        // 自动识别出的候选
-        for step in Rewriter.candidates(for: item.text) {
-            let result = Rewriter.apply(item.text, steps: [step])
-            guard result.ok else { continue }
-            let title = "\(step.op.displayName) → \(String(result.output.prefix(18)))"
-            actions.append(UIAction(title: title, image: UIImage(systemName: "wand.and.stars")) { [weak self] _ in
-                self?.onRewrite?(item, step)
-            })
+        // 自动识别出的「推荐」
+        let recOps = Rewriter.candidates(for: item.text).map { $0.op }
+        var recommended: [UIAction] = []
+        for op in recOps {
+            guard let hit = options.first(where: { $0.op == op }) else { continue }
+            recommended.append(action(item, hit, icon: "wand.and.stars"))
         }
 
-        // 固定几个常用
-        for op in [RewriteOp.urlDecode, .jsonPretty, .dedupeLines] where !actions.contains(where: { $0.title.hasPrefix(op.displayName) }) {
-            actions.append(UIAction(title: op.displayName, image: UIImage(systemName: "text.badge.checkmark")) { [weak self] _ in
-                self?.onRewrite?(item, RewriteStep(op))
-            })
+        var children: [UIMenuElement] = []
+        if !recommended.isEmpty {
+            children.append(UIMenu(title: "推荐", options: .displayInline, children: recommended))
         }
 
-        let rewriteMenu = UIMenu(title: "重写内容", children: actions)
+        for section in ["编码", "文本", "哈希"] {
+            let acts = options
+                .filter { $0.op.section == section && !recOps.contains($0.op) }
+                .map { action(item, $0, icon: $0.op.iconName) }
+            guard !acts.isEmpty else { continue }
+            children.append(UIMenu(title: section, options: .displayInline, children: acts))
+        }
 
+        guard !children.isEmpty else { return nil }
+        return UIMenu(children: children)
+    }
+
+    private func action(_ item: ClipItem, _ option: Rewriter.Option, icon: String) -> UIAction {
+        // 标题用「算子名」，副标题位置显示结果预览（iOS 14+ UIAction 无 subtitle，塞进标题尾部）
+        let title = "\(option.title)  \(option.detail)"
+        return UIAction(title: title, image: UIImage(systemName: icon)) { [weak self] _ in
+            self?.onRewrite?(item, option.step)
+        }
+    }
+
+    private func rowMenu(for item: ClipItem) -> UIMenu {
         let pin = UIAction(
             title: item.pinned ? "取消置顶" : "置顶",
             image: UIImage(systemName: item.pinned ? "pin.slash" : "pin")
@@ -135,7 +154,12 @@ final class ClipPanelView: UIView {
             self?.onDelete?(item)
         }
 
-        return UIMenu(children: [rewriteMenu, pin, del])
+        var children: [UIMenuElement] = []
+        if let rewrite = menu(for: item) {
+            children.append(rewrite)
+        }
+        children.append(contentsOf: [pin, del])
+        return UIMenu(children: children)
     }
 }
 
@@ -151,6 +175,11 @@ extension ClipPanelView: UITableViewDataSource, UITableViewDelegate {
         let cell = tableView.dequeueReusableCell(withIdentifier: "cell", for: indexPath) as! ClipCell
         let item = items[indexPath.row]
         cell.configure(with: item, query: query)
+
+        // 常驻重写按钮：每行一个 UIMenu，点一下就出菜单，不用长按猜
+        cell.rewriteButton.menu = menu(for: item)
+        cell.rewriteButton.showsMenuAsPrimaryAction = true
+        cell.rewriteButton.isEnabled = cell.rewriteButton.menu != nil
         return cell
     }
 
@@ -164,7 +193,7 @@ extension ClipPanelView: UITableViewDataSource, UITableViewDelegate {
                    point: CGPoint) -> UIContextMenuConfiguration? {
         let item = items[indexPath.row]
         return UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { [weak self] _ in
-            self?.menu(for: item)
+            self?.rowMenu(for: item)
         }
     }
 }
@@ -189,6 +218,7 @@ final class ClipCell: UITableViewCell {
     private let previewLabel = UILabel()
     private let metaLabel = UILabel()
     private let pinIcon = UIImageView(image: UIImage(systemName: "pin.fill"))
+    let rewriteButton = UIButton(type: .system)
 
     override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
         super.init(style: style, reuseIdentifier: reuseIdentifier)
@@ -207,21 +237,31 @@ final class ClipCell: UITableViewCell {
         pinIcon.translatesAutoresizingMaskIntoConstraints = false
         pinIcon.isHidden = true
 
+        rewriteButton.setImage(UIImage(systemName: "wand.and.stars"), for: .normal)
+        rewriteButton.tintColor = .systemBlue
+        rewriteButton.translatesAutoresizingMaskIntoConstraints = false
+
         contentView.addSubview(previewLabel)
         contentView.addSubview(metaLabel)
         contentView.addSubview(pinIcon)
+        contentView.addSubview(rewriteButton)
 
         NSLayoutConstraint.activate([
+            rewriteButton.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -6),
+            rewriteButton.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
+            rewriteButton.widthAnchor.constraint(equalToConstant: 40),
+            rewriteButton.heightAnchor.constraint(equalToConstant: 40),
+
             previewLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 12),
-            previewLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -30),
+            previewLabel.trailingAnchor.constraint(equalTo: rewriteButton.leadingAnchor, constant: -6),
             previewLabel.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 8),
 
             metaLabel.leadingAnchor.constraint(equalTo: previewLabel.leadingAnchor),
             metaLabel.topAnchor.constraint(equalTo: previewLabel.bottomAnchor, constant: 2),
             metaLabel.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor, constant: -6),
 
-            pinIcon.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -10),
-            pinIcon.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
+            pinIcon.trailingAnchor.constraint(equalTo: previewLabel.trailingAnchor, constant: -2),
+            pinIcon.centerYAnchor.constraint(equalTo: metaLabel.centerYAnchor),
             pinIcon.widthAnchor.constraint(equalToConstant: 12),
             pinIcon.heightAnchor.constraint(equalToConstant: 12)
         ])

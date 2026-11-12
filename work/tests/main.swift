@@ -40,6 +40,38 @@ check(Rewriter.candidates(for: "{\"a\":1}").contains { $0.op == .jsonPretty }, "
 check(Rewriter.candidates(for: "a%20b").contains { $0.op == .urlDecode }, "识别 url 编码")
 check(Rewriter.candidates(for: "随便一段话").isEmpty, "普通文本无候选")
 
+print("== v10 新增算子 ==")
+eq(Rewriter.apply("a   b\t\tc", steps: [RewriteStep(.collapseSpaces)]).output, "a b c", "合并空白")
+eq(Rewriter.apply("a\n\n\nb\n", steps: [RewriteStep(.stripBlankLines)]).output, "a\nb", "去空行")
+check(Rewriter.apply("支付回调日志", steps: [RewriteStep(.tokenize)]).output.contains("支付"), "分词算子")
+
+print("== 可用算子过滤（v9 的关键 bug）==")
+// 纯文本：v9 列出的 URL 解码/美化 JSON/按行去重全是 no-op 或必失败
+let plain = "Syscon Infoway Pvt. Ltd"
+let plainOps = Rewriter.options(for: plain).map { $0.op }
+check(!plainOps.contains(.urlDecode), "纯文本不出现 URL 解码（no-op）")
+check(!plainOps.contains(.jsonPretty), "纯文本不出现美化 JSON（必失败）")
+check(!plainOps.contains(.dedupeLines), "单行不出现按行去重（no-op）")
+check(plainOps.contains(.base64Encode), "纯文本保留 Base64 编码")
+check(plainOps.contains(.upper), "纯文本保留转大写")
+check(plainOps.contains(.sha256), "纯文本保留 SHA-256")
+check(plainOps.count >= 5, "纯文本至少 5 个可用算子", "\(plainOps)")
+
+let jsonOps = Rewriter.options(for: "{\"a\":1}").map { $0.op }
+check(jsonOps.contains(.jsonPretty), "JSON 出现美化")
+let multiOps = Rewriter.options(for: "b\na\nb").map { $0.op }
+check(multiOps.contains(.dedupeLines) && multiOps.contains(.sortLines), "多行出现行算子")
+let b64Ops = Rewriter.options(for: "aGVsbG8=").map { $0.op }
+check(b64Ops.contains(.base64Decode), "Base64 串出现解码")
+// 所有列出的算子都必须真的能改变内容
+for text in [plain, "{\"a\":1}", "b\na\nb", "aGVsbG8=", "a%20b", "  空格  "] {
+    let allEffective = Rewriter.options(for: text).allSatisfy { opt in
+        let r = Rewriter.run(text, opt.step)
+        return r.ok && r.output != text
+    }
+    check(allEffective, "列出的算子都有效果: \(text)", "\(Rewriter.options(for: text).map { $0.op })")
+}
+
 print("== Tokenizer ==")
 let t1 = Tokenizer.tokens("支付回调日志")
 check(t1.contains("支付") && t1.contains("回调"), "中文 2-gram", "\(t1)")

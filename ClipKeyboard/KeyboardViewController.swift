@@ -87,14 +87,16 @@ final class KeyboardViewController: UIInputViewController {
     private func rewrite(_ item: ClipItem, _ step: RewriteStep) {
         let result = Rewriter.apply(item.text, steps: [step])
         guard result.ok else {
-            updateStatus(result.error ?? "重写失败")
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+            updateStatus("\(step.op.displayName)失败：\(result.error ?? "未知原因")")
             return
         }
         textDocumentProxy.insertText(result.output)
-        // 重写结果也存一条，便于二次使用
-        store?.upsert(result.output, source: "keyboard")
+        // 重写结果存一条，便于二次使用（同内容会命中去重，只更新时间戳）
+        store?.upsert(result.output, source: "rewrite")
         panel.reload()
-        updateStatus("\(step.op.displayName) → 已插入")
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        updateStatus("\(step.op.displayName) → 已插入 \(result.output.count) 字")
     }
 
     // MARK: - UI

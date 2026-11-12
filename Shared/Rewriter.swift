@@ -4,6 +4,7 @@
 //
 //  与 Python 参考实现（tasks/clip-sync-prototype）保持语义一致，
 //  可用 spec-conformance.json 的 41 条向量做回归。
+//  v10 追加 collapseSpaces / stripBlankLines / tokenize 三个文本算子。
 //
 
 import Foundation
@@ -27,7 +28,11 @@ public enum RewriteOp: String, Codable, CaseIterable {
     case numberLines = "number_lines"
     case regexReplace = "regex_replace"
     case sha256
-    
+    // v10
+    case collapseSpaces = "collapse_spaces"
+    case stripBlankLines = "strip_blank_lines"
+    case tokenize
+
     public var displayName: String {
         switch self {
         case .base64Encode: return "Base64 编码"
@@ -46,6 +51,38 @@ public enum RewriteOp: String, Codable, CaseIterable {
         case .numberLines: return "加行号"
         case .regexReplace: return "正则替换"
         case .sha256: return "SHA-256"
+        case .collapseSpaces: return "合并空白"
+        case .stripBlankLines: return "去空行"
+        case .tokenize: return "分词"
+        }
+    }
+
+    /// 菜单里的分组，顺序即展示顺序
+    public var section: String {
+        switch self {
+        case .base64Encode, .base64Decode, .urlEncode, .urlDecode,
+             .hexEncode, .hexDecode, .jsonPretty, .jsonMinify:
+            return "编码"
+        case .trim, .upper, .lower, .sortLines, .dedupeLines,
+             .numberLines, .collapseSpaces, .stripBlankLines, .tokenize, .regexReplace:
+            return "文本"
+        case .sha256:
+            return "哈希"
+        }
+    }
+
+    public var iconName: String {
+        switch self {
+        case .base64Encode, .base64Decode: return "chevron.left.forwardslash.chevron.right"
+        case .urlEncode, .urlDecode: return "link"
+        case .hexEncode, .hexDecode: return "number"
+        case .jsonPretty, .jsonMinify: return "curlybraces"
+        case .trim, .collapseSpaces, .stripBlankLines: return "scissors"
+        case .upper, .lower: return "textformat.size"
+        case .sortLines, .dedupeLines, .numberLines: return "list.number"
+        case .regexReplace: return "asterisk"
+        case .sha256: return "lock"
+        case .tokenize: return "text.word.spacing"
         }
     }
 }
@@ -72,6 +109,8 @@ public struct RewriteResult {
     public let output: String
     public let steps: [RewriteStepResult]
     public let error: String?
+
+    public var changed: Bool { ok && !steps.isEmpty && steps.last!.output != steps.first!.output }
 }
 
 // MARK: - 执行器
@@ -224,6 +263,33 @@ public enum Rewriter {
 
         case .sha256:
             return ClipItem.sha256(input)
+
+        case .collapseSpaces:
+            // 连续空白压成一个空格，换行保留（不破坏行结构）
+            let lines = input.components(separatedBy: "\n").map { line -> String in
+                var out = ""
+                var lastWasSpace = false
+                for ch in line {
+                    if ch == " " || ch == "\t" || ch == "\u{3000}" {
+                        if !lastWasSpace { out.append(" ") }
+                        lastWasSpace = true
+                    } else {
+                        out.append(ch)
+                        lastWasSpace = false
+                    }
+                }
+                return out.trimmingCharacters(in: .whitespaces)
+            }
+            return lines.joined(separator: "\n")
+
+        case .stripBlankLines:
+            return input.components(separatedBy: "\n")
+                .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+                .joined(separator: "\n")
+
+        case .tokenize:
+            // 复用检索用分词器：中文 2-gram + 英文小写，空格连接，可直接当标签用
+            return Tokenizer.tokens(input).joined(separator: " ")
         }
     }
 
@@ -266,9 +332,107 @@ public enum Rewriter {
             out.append(RewriteStep(.dedupeLines))
         }
 
-        // 去重
         var uniq: [RewriteStep] = []
         for s in out where !uniq.contains(where: { $0.op == s.op }) { uniq.append(s) }
         return Array(uniq.prefix(3))
+    }
+
+    // MARK: - 可用算子（v10）
+
+    /// 一个「点了确实会变」的选项
+    public struct Option {
+        public let step: RewriteStep
+        public let title: String      // 显示名
+        public let detail: String     // 结果预览
+
+        public var op: RewriteOp { step.op }
+    }
+
+    /// 当前内容真正可用的算子：会失败的不列，点了不变的也不列。
+    /// 这是 v10 的关键修正——v9 对纯文本列出三个 no-op，看起来像「功能没做」。
+    public static func options(for text: String) -> [Option] {
+        guard !text.isEmpty else { return [] }
+        let lineCount = text.components(separatedBy: "\n").count
+        let hasLetter = text.rangeOfCharacter(from: .letters) != nil
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var out: [Option] = []
+
+        for step in genericCandidates(reversed: false) {
+            guard let changed = changedOutput(of: text, step: step) else { continue }
+            out.append(Option(step: step, title: step.op.displayName, detail: preview(changed)))
+        }
+
+        // 解码类：只在能解、且结果不同时出现
+        for step in decodeCandidates(for: text) {
+            guard let changed = changedOutput(of: text, step: step) else { continue }
+            out.append(Option(step: step, title: step.op.displayName, detail: preview(changed)))
+        }
+
+        // 行操作：单行无意义
+        if lineCount >= 2 {
+            for step in [RewriteStep(.dedupeLines), RewriteStep(.sortLines), RewriteStep(.numberLines),
+                         RewriteStep(.stripBlankLines)] {
+                guard let changed = changedOutput(of: text, step: step) else { continue }
+                out.append(Option(step: step, title: step.op.displayName, detail: preview(changed)))
+            }
+        }
+
+        // 文本类
+        if trimmed != text, let s = changedOutput(of: text, step: RewriteStep(.trim)) {
+            out.append(Option(step: RewriteStep(.trim), title: "去首尾空白", detail: preview(s)))
+        }
+        if hasLetter, let s = changedOutput(of: text, step: RewriteStep(.upper)) {
+            out.append(Option(step: RewriteStep(.upper), title: "转大写", detail: preview(s)))
+        }
+        if hasLetter, let s = changedOutput(of: text, step: RewriteStep(.lower)) {
+            out.append(Option(step: RewriteStep(.lower), title: "转小写", detail: preview(s)))
+        }
+        if let s = changedOutput(of: text, step: RewriteStep(.collapseSpaces)) {
+            out.append(Option(step: RewriteStep(.collapseSpaces), title: "合并空白", detail: preview(s)))
+        }
+        if let s = changedOutput(of: text, step: RewriteStep(.tokenize)) {
+            out.append(Option(step: RewriteStep(.tokenize), title: "分词", detail: preview(s)))
+        }
+
+        // 去重（按 op 收敛）
+        var uniq: [Option] = []
+        for o in out where !uniq.contains(where: { $0.op == o.op }) { uniq.append(o) }
+        return uniq
+    }
+
+    /// 无条件可用的编码/哈希类（永远产生新内容）
+    public static func genericCandidates(reversed: Bool) -> [RewriteStep] {
+        let list: [RewriteStep] = [
+            RewriteStep(.base64Encode),
+            RewriteStep(.urlEncode),
+            RewriteStep(.hexEncode),
+            RewriteStep(.sha256),
+            RewriteStep(.jsonPretty),
+            RewriteStep(.jsonMinify)
+        ]
+        return reversed ? list.reversed() : list
+    }
+
+    /// 解码类
+    public static func decodeCandidates(for text: String) -> [RewriteStep] {
+        [
+            RewriteStep(.base64Decode),
+            RewriteStep(.urlDecode),
+            RewriteStep(.hexDecode)
+        ]
+    }
+
+    /// 执行一次；失败返回 nil；结果与输入相同返回 nil（no-op 不展示）
+    private static func changedOutput(of text: String, step: RewriteStep) -> String? {
+        let r = run(text, step)
+        guard r.ok, r.output != text else { return nil }
+        return r.output
+    }
+
+    public static func preview(_ s: String, limit: Int = 24) -> String {
+        let flat = s.replacingOccurrences(of: "\n", with: " ⏎ ")
+            .trimmingCharacters(in: .whitespaces)
+        return flat.count <= limit ? flat : String(flat.prefix(limit)) + "…"
     }
 }
