@@ -23,6 +23,9 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <netdb.h>
+#import <netinet/in.h>
+#import <arpa/inet.h>
+#import <sys/socket.h>
 #import <dlfcn.h>
 #import <stdatomic.h>
 #import <QuartzCore/QuartzCore.h>
@@ -354,6 +357,63 @@ static cfhost_create_t  WTGOrigHostCreate;
 static cfhost_resolve_t WTGOrigHostResolve;
 static uintptr_t g_slotCreate, g_slotResolve;   // 被我们改写的槽位地址（懒绑定会把它们改回去，用完补回）
 
+typedef int (*gai_t)(const char *, const char *, const struct addrinfo *, struct addrinfo **);
+typedef int (*connect_t)(int, const struct sockaddr *, socklen_t);
+static gai_t     WTGOrigGAI;
+static connect_t WTGOrigConnect;
+
+static int wtg_gai(const char *node, const char *service,
+                   const struct addrinfo *hints, struct addrinfo **res) {
+    if (!WTGOrigGAI) return EAI_FAIL;
+    if (node && WTGOn()) {
+        @autoreleasepool {
+            NSString *host = [NSString stringWithUTF8String:node];
+            if (host) {
+                BOOL fresh = NO;
+                @synchronized (WTGSeen()) {
+                    if (![WTGSeen() containsObject:host]) { [WTGSeen() addObject:host]; fresh = YES; }
+                }
+                if (fresh) WTGLog(@"[obs] DNS 解析 %@", host);
+                if (WTGHostBlocked(host)) {
+                    WTGHit([NSString stringWithFormat:@"DNS 拦截 %@", host]);
+                    return EAI_NONAME;
+                }
+            }
+        }
+    }
+    return WTGOrigGAI(node, service, hints, res);
+}
+
+static int wtg_connect(int fd, const struct sockaddr *addr, socklen_t len) {
+    if (!WTGOrigConnect) return -1;
+    if (addr && WTGOn()) {
+        @autoreleasepool {
+            char buf[96] = {0};
+            if (addr->sa_family == AF_INET) {
+                const struct sockaddr_in *in = (const struct sockaddr_in *)addr;
+                char ip[46];
+                inet_ntop(AF_INET, &in->sin_addr, ip, sizeof(ip));
+                snprintf(buf, sizeof(buf), "%s:%d", ip, ntohs(in->sin_port));
+            } else if (addr->sa_family == AF_INET6) {
+                const struct sockaddr_in6 *in6 = (const struct sockaddr_in6 *)addr;
+                char ip[64];
+                inet_ntop(AF_INET6, &in6->sin6_addr, ip, sizeof(ip));
+                snprintf(buf, sizeof(buf), "[%s]:%d", ip, ntohs(in6->sin6_port));
+            }
+            if (buf[0]) {
+                NSString *k = [NSString stringWithUTF8String:buf];
+                BOOL fresh = NO;
+                @synchronized (WTGSeen()) {
+                    NSString *tag = [@"tcp://" stringByAppendingString:k];
+                    if (![WTGSeen() containsObject:tag]) { [WTGSeen() addObject:tag]; fresh = YES; }
+                }
+                if (fresh) WTGLog(@"[obs] 建立连接 %@", k);
+            }
+        }
+    }
+    return WTGOrigConnect(fd, addr, len);
+}
+
 static void wtg_repatch(void);
 static CFHostRef wtg_host_create(CFAllocatorRef alloc, CFStringRef name);
 static Boolean wtg_host_resolve(CFHostRef host, CFHostInfoType info, CFErrorRef *err);
@@ -502,8 +562,10 @@ static void wtg_patch_host_image(void) {
         if (!sym) continue;
         NSString *t = sym;
         if ([t hasPrefix:@"_"]) t = [t substringFromIndex:1];
-        if ([t isEqualToString:@"CFHostCreateWithName"])       plan[@(i)] = @0;
+        if ([t isEqualToString:@"CFHostCreateWithName"])           plan[@(i)] = @0;
         else if ([t isEqualToString:@"CFHostStartInfoResolution"]) plan[@(i)] = @1;
+        else if ([t isEqualToString:@"getaddrinfo"])               plan[@(i)] = @3;
+        else if ([t isEqualToString:@"connect"])                   plan[@(i)] = @4;
         else continue;
         [names addObject:sym];
     }
@@ -528,14 +590,27 @@ static void wtg_patch_host_image(void) {
                 if (isBind) {
                     NSNumber *kind = plan[@((uint32_t)(v & 0xFFFFFF))];
                     if (kind && wtg_addr_in_sections(cur)) {
-                        if (kind.intValue == 0) {
-                            if (!WTGOrigHostCreate) WTGOrigHostCreate = (cfhost_create_t)(uintptr_t)v;
-                            g_slotCreate = cur;
-                            *(uint64_t *)cur = (uint64_t)(uintptr_t)&wtg_host_create;
-                        } else {
-                            if (!WTGOrigHostResolve) WTGOrigHostResolve = (cfhost_resolve_t)(uintptr_t)v;
-                            g_slotResolve = cur;
-                            *(uint64_t *)cur = (uint64_t)(uintptr_t)&wtg_host_resolve;
+                        switch (kind.intValue) {
+                            case 0:
+                                if (!WTGOrigHostCreate) WTGOrigHostCreate = (cfhost_create_t)(uintptr_t)v;
+                                g_slotCreate = cur;
+                                *(uint64_t *)cur = (uint64_t)(uintptr_t)&wtg_host_create;
+                                break;
+                            case 1:
+                                if (!WTGOrigHostResolve) WTGOrigHostResolve = (cfhost_resolve_t)(uintptr_t)v;
+                                g_slotResolve = cur;
+                                *(uint64_t *)cur = (uint64_t)(uintptr_t)&wtg_host_resolve;
+                                break;
+                            case 3:
+                                if (!WTGOrigGAI) WTGOrigGAI = (gai_t)(uintptr_t)v;
+                                *(uint64_t *)cur = (uint64_t)(uintptr_t)&wtg_gai;
+                                break;
+                            case 4:
+                                if (!WTGOrigConnect) WTGOrigConnect = (connect_t)(uintptr_t)v;
+                                *(uint64_t *)cur = (uint64_t)(uintptr_t)&wtg_connect;
+                                break;
+                            default:
+                                break;
                         }
                         patched++;
                     }
