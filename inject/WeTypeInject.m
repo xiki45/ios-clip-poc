@@ -71,12 +71,30 @@ static void WTSetState(UIButton *btn, NSString *title, UIColor *bg) {
 
 #pragma mark - 插入
 
-static NSString *WTPayload(void) {
+/// 读剪贴板，同时把诊断信息带出来（读不到时用户能一眼看出原因）
+static NSString *WTPayload(NSString **diagOut) {
     UIPasteboard *pb = [UIPasteboard generalPasteboard];
+    NSUInteger items = pb.numberOfItems;
+    BOOL hasStrings = pb.hasStrings;
+    NSInteger changeCount = pb.changeCount;
     NSString *s = pb.string;
-    if (s.length == 0) return @"(剪贴板为空)";
-    if (s.length > 1000) s = [s substringToIndex:1000];
-    return s;
+    NSArray *strings = pb.strings;
+
+    NSURL *group = [[NSFileManager defaultManager]
+                    containerURLForSecurityApplicationGroupIdentifier:@"group.com.tencent.wetype"];
+    BOOL groupOK = (group != nil);
+
+    NSString *diag = [NSString stringWithFormat:
+                      @"items=%lu hasStrings=%d len=%lu strings=%lu cc=%ld appGroup=%d",
+                      (unsigned long)items, (int)hasStrings,
+                      (unsigned long)(s.length), (unsigned long)strings.count,
+                      (long)changeCount, (int)groupOK];
+    if (diagOut) *diagOut = diag;
+    WTLog(@"剪贴板诊断: %@", diag);
+
+    if (s.length > 0) return s.length > 1000 ? [s substringToIndex:1000] : s;
+    if (strings.count > 0) return [strings firstObject];
+    return nil;
 }
 
 static BOOL WTInsert(UIViewController *vc, NSString *text, UIButton *btn) {
@@ -116,8 +134,17 @@ static BOOL WTInsert(UIViewController *vc, NSString *text, UIButton *btn) {
     WTLog(@"触发(%@)", reason);
     WTSetState(self.button, @"①", WTOrange());
 
-    BOOL ok = WTInsert(self.host, WTPayload(), self.button);
-    WTSetState(self.button, ok ? @"✓" : @"✗", ok ? WTGreen() : WTRed());
+    NSString *diag = nil;
+    NSString *payload = WTPayload(&diag);
+    if (payload.length == 0) {
+        // 读不到就把诊断直接写进输入框，肉眼可见，不用连电脑
+        NSString *msg = [NSString stringWithFormat:@"[诊断]%@", diag];
+        WTInsert(self.host, msg, self.button);
+        WTSetState(self.button, @"读空", WTRed());
+    } else {
+        BOOL ok = WTInsert(self.host, payload, self.button);
+        WTSetState(self.button, ok ? @"✓" : @"✗", ok ? WTGreen() : WTRed());
+    }
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
@@ -279,7 +306,7 @@ static void WTSwizzle(Class cls, SEL sel, void *replacement, void **original) {
 }
 
 static void WTInitInner(void) {
-    WTLog(@"===== dylib v5 loaded =====");
+    WTLog(@"===== dylib v6 loaded =====");
     Class cls = objc_getClass("WBInputViewController");
     if (!cls) { WTLog(@"!! 找不到 WBInputViewController"); return; }
     WTSwizzle(cls, @selector(viewDidLoad), (void *)wt_viewDidLoad, (void **)&orig_viewDidLoad);
