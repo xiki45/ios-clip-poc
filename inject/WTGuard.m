@@ -73,6 +73,24 @@ static void WTGLog(NSString *fmt, ...) {
     }
 }
 
+static NSString *WTGLinesMatching(NSString *needle, NSUInteger maxLines) {
+    NSString *all = [NSString stringWithContentsOfFile:WTGLogPath()
+                                              encoding:NSUTF8StringEncoding error:NULL];
+    if (all.length == 0) return @"";
+    NSArray *ls = [all componentsSeparatedByString:@"\n"];
+    NSMutableArray *picked = [NSMutableArray array];
+    BOOL any = NO;
+    for (NSInteger i = (NSInteger)ls.count - 1; i >= 0 && picked.count < maxLines; i--) {
+        NSString *l = ls[i];
+        if ([l containsString:needle]) {
+            NSString *shown = l.length > 96 ? [NSString stringWithFormat:@"…%@", [l substringFromIndex:l.length - 96]] : l;
+            [picked insertObject:shown atIndex:0];
+        }
+    }
+    (void)any;
+    return [picked componentsJoinedByString:@" | "];
+}
+
 static NSString *WTGLogTail(NSUInteger lines) {
     NSString *all = [NSString stringWithContentsOfFile:WTGLogPath()
                                               encoding:NSUTF8StringEncoding
@@ -135,7 +153,8 @@ static void WTGHit(NSString *what) {
 
 static NSString *WTGSummary(void) {
     NSMutableString *m = [NSMutableString string];
-    [m appendFormat:@"—— 拦截汇总：共 %lu 次 / %lu 种 reportID ——", (unsigned long)WTGCount,
+    [m appendFormat:@"——[%@] 拦截汇总：共 %lu 次 / %lu 种 reportID ——",
+     atomic_load(&g_isApp) ? @"app" : @"kb", (unsigned long)WTGCount,
      (unsigned long)WTGIDs().count];
     NSArray *keys = [WTGIDs() keysSortedByValueUsingComparator:^NSComparisonResult(NSNumber *a, NSNumber *b) {
         return [b compare:a];
@@ -554,8 +573,12 @@ static const void *kLongKey = &kLongKey;
 }
 
 - (void)insertTail {
-    NSString *tail = [WTGSummary() stringByAppendingFormat:@" %@", WTGLogTail(12)];
-    if (tail.length > 1400) tail = [tail substringFromIndex:tail.length - 1400];
+    NSString *obs = WTGLinesMatching(@"[obs]", 10);
+    NSString *blocks = WTGLinesMatching(@"拦截 ", 6);
+    NSString *tail = [NSString stringWithFormat:@"%@  ｜ 出网: %@  ｜ 最近拦截: %@",
+                      WTGSummary(), obs.length ? obs : @"(本次没有记录到 NSURLSession 请求)",
+                      blocks.length ? blocks : @"-"];
+    if (tail.length > 1600) tail = [tail substringFromIndex:tail.length - 1600];
     UIViewController *vc = self.host;
     if (![vc isKindOfClass:[UIInputViewController class]]) return;
     id proxy = [(UIInputViewController *)vc textDocumentProxy];
