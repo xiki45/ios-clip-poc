@@ -31,7 +31,8 @@
 
 static NSString *const kGroupID      = @"group.com.tencent.wetype";
 static NSString *const kKeyEnabled   = @"wtguard_enabled";
-static NSString *const kKeyAllowCrash = @"wtguard_allow_crash";
+static NSString *const kKeyAllowCrash   = @"wtguard_allow_crash";    // 允许崩溃上报
+static NSString *const kKeyAllowUploads = @"wtguard_allow_uploads";  // 允许 upload-file/upload-json（反馈包）
 
 #pragma mark - 日志
 
@@ -253,7 +254,13 @@ static BOOL WTGHostBlocked(NSString *host) {
     return NO;
 }
 
+static BOOL WTGAllowUploads(void) {
+    id v = [[NSUserDefaults standardUserDefaults] objectForKey:kKeyAllowUploads];
+    return v ? [v boolValue] : NO;
+}
+
 static BOOL WTGPathBlocked(NSURL *url) {
+    if (WTGAllowUploads()) return NO;   // 逃生开关：图片/反馈上传走同一条路时打开
     NSString *p = url.path.lowercaseString;
     if (p.length == 0) return NO;
     // 日志/反馈包上传（微信 CDN 上传模板）
