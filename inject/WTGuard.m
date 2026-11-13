@@ -92,7 +92,7 @@ static void WTGLoadState(void) {
     atomic_store(&g_enabled, en ? ([en boolValue] ? 1 : 0) : 1);
     id st = [d objectForKey:kKeyAppStage];
     int s = st ? [st intValue] : 2;      // S0-S2 已验证可用，新装默认 S2
-    atomic_store(&g_stage, MAX(0, MIN(3, s)));
+    atomic_store(&g_stage, MAX(0, MIN(4, s)));
 }
 
 static int WTGAppStageDisplay(void) {
@@ -269,6 +269,209 @@ static BOOL WTGPathBlocked(NSURL *url) {
 // v3 直接删掉这一层：埋点收口 + NSURLProtocol 已经覆盖绝大部分，
 // 换取「主 App 一定能启动」这个确定性。
 
+
+#pragma mark - S4：DNS 层（安全版，只改自己镜像的导入槽）
+
+// 实测发现：WeType 自己不用 getaddrinfo，它走的是 CFHost（CFNetwork）。
+//   wxkb        : 导入 _CFHostCreateWithName / _CFHostStartInfoResolution …
+//   wxkb_plugin : 同上
+// 所以 v1 那个全局 getaddrinfo interpose 拦到的其实是系统框架内部的调用 —— 范围太大、
+// 时机太早（镜像加载即生效，早于 constructor），这正是主 App 启动即崩的原因。
+//
+// v5 改成：constructor 里（dyld 已稳定）遍历主镜像的 chained fixups，
+// 把导入名为 CFHost* 的槽位换成我们的函数，原地址存下来照常调用。
+// 只影响 WeType 自己的镜像，系统/框架一概不碰，也不可能在启动早期被触发。
+
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+
+typedef CFHostRef (*cfhost_create_t)(CFAllocatorRef, CFStringRef);
+typedef Boolean  (*cfhost_resolve_t)(CFHostRef, CFHostInfoType, CFErrorRef *);
+
+static cfhost_create_t  WTGOrigHostCreate;
+static cfhost_resolve_t WTGOrigHostResolve;
+static NSMapTable *WTGHostNames;      // CFHostRef -> CFStringRef(host)
+
+static NSMapTable *WTGHostMap(void) {
+    static NSMapTable *m = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        m = [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsOpaqueMemory
+                                  valueOptions:NSPointerFunctionsStrongMemory];
+    });
+    return m;
+}
+
+static CFHostRef wtg_host_create(CFAllocatorRef alloc, CFStringRef name) {
+    CFHostRef host = WTGOrigHostCreate ? WTGOrigHostCreate(alloc, name) : NULL;
+    if (host && name) {
+        @synchronized (WTGHostMap()) { [WTGHostMap() setObject:(__bridge id)name forKey:(__bridge id)host]; }
+    }
+    return host;
+}
+
+static Boolean wtg_host_resolve(CFHostRef host, CFHostInfoType info, CFErrorRef *err) {
+    if (host) {
+        @try {
+            NSString *name = nil;
+            @synchronized (WTGHostMap()) {
+                id stored = [WTGHostMap() objectForKey:(__bridge id)host];
+                if (stored) name = [(NSString *)stored copy];
+            }
+            if (name.length) {
+                BOOL fresh = NO;
+                @synchronized (WTGSeen()) {
+                    if (![WTGSeen() containsObject:name]) { [WTGSeen() addObject:name]; fresh = YES; }
+                }
+                if (fresh) WTGLog(@"DNS 看到 %@", name);
+                if (WTGOn() && WTGHostBlocked(name)) {
+                    WTGHit([NSString stringWithFormat:@"DNS 拦截 %@", name]);
+                    return false;      // 走 CFHost 正常的失败分支
+                }
+            }
+        } @catch (NSException *e) {}
+    }
+    return WTGOrigHostResolve ? WTGOrigHostResolve(host, info, err) : false;
+}
+
+#define WTG_MAX_SEC 24
+static struct { uint64_t addr; uint64_t size; } g_secs[WTG_MAX_SEC];
+static int g_secCount;
+
+static BOOL wtg_addr_in_sections(uintptr_t a) {
+    for (int i = 0; i < g_secCount; i++) {
+        if (a >= g_secs[i].addr && a < g_secs[i].addr + g_secs[i].size) return YES;
+    }
+    return NO;
+}
+
+static void wtg_collect_sections(const struct mach_header_64 *mh, uintptr_t base, uint64_t textVm) {
+    g_secCount = 0;
+    const uint8_t *p = (const uint8_t *)(mh + 1);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)p;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+            const struct section_64 *sc = (const struct section_64 *)(sg + 1);
+            for (uint32_t j = 0; j < sg->nsects && g_secCount < WTG_MAX_SEC; j++) {
+                if (!strcmp(sc[j].sectname, "__la_symbol_ptr") ||
+                    !strcmp(sc[j].sectname, "__got") ||
+                    !strcmp(sc[j].sectname, "__auth_got")) {
+                    g_secs[g_secCount].addr = base + (sc[j].addr - textVm);
+                    g_secs[g_secCount].size = sc[j].size;
+                    g_secCount++;
+                }
+            }
+        }
+        p += lc->cmdsize;
+    }
+}
+
+struct wtg_fixups_header {
+    uint32_t fixups_version, starts_offset, imports_offset, symbols_offset;
+    uint32_t imports_count, imports_format, symbols_format;
+};
+struct wtg_starts_in_image { uint32_t seg_count; uint32_t seg_info_offset[1]; };
+struct wtg_starts_in_segment {
+    uint32_t size; uint16_t page_size, pointer_format;
+    uint64_t segment_offset; uint32_t max_valid_pointer; uint16_t page_count, page_start[1];
+};
+
+static void wtg_patch_host_image(void) {
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(0);
+    if (!mh || mh->magic != MH_MAGIC_64) { WTGLog(@"DNS：取不到主镜像头"); return; }
+    uintptr_t base = (uintptr_t)mh;
+
+    uint64_t textVm = 0, leVm = 0, leOff = 0;
+    BOOL hasLe = NO;
+    const struct linkedit_data_command *cf = NULL;
+    const uint8_t *p = (const uint8_t *)(mh + 1);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)p;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+            if (!strcmp(sg->segname, "__TEXT")) textVm = sg->vmaddr;
+            if (!strcmp(sg->segname, "__LINKEDIT")) { leVm = sg->vmaddr; leOff = sg->fileoff; hasLe = YES; }
+        } else if (lc->cmd == LC_DYLD_CHAINED_FIXUPS) {
+            cf = (const struct linkedit_data_command *)lc;
+        }
+        p += lc->cmdsize;
+    }
+    if (!cf || !hasLe) { WTGLog(@"DNS：镜像缺 chained fixups / __LINKEDIT，跳过"); return; }
+
+    wtg_collect_sections(mh, base, textVm);
+    if (g_secCount == 0) { WTGLog(@"DNS：没找到 __got/__la_symbol_ptr"); return; }
+
+    const uint8_t *fix = (const uint8_t *)(base + (leVm - textVm) + (cf->dataoff - leOff));
+    const struct wtg_fixups_header *h = (const struct wtg_fixups_header *)fix;
+    if (h->imports_format != 1 && h->imports_format != 3) {
+        WTGLog(@"DNS：imports_format=%u 不支持", h->imports_format);
+        return;
+    }
+    const uint8_t *imports = fix + h->imports_offset;
+    const char *syms = (const char *)(fix + h->symbols_offset);
+
+    NSMutableDictionary<NSNumber *, NSNumber *> *plan = [NSMutableDictionary dictionary];  // ordinal -> 0/1/2
+    NSMutableArray<NSString *> *names = [NSMutableArray array];
+    for (uint32_t i = 0; i < h->imports_count; i++) {
+        uint32_t nameOff = 0;
+        if (h->imports_format == 1) {
+            struct { uint32_t lib:8, weak:1, name:23; } im;
+            memcpy(&im, imports + i * 4, 4);
+            nameOff = im.name;
+        } else {
+            struct { uint64_t ord:16, weak:1, res:15, name:32; uint64_t addend; } im;
+            memcpy(&im, imports + i * 16, 16);
+            nameOff = (uint32_t)im.name;
+        }
+        NSString *sym = [NSString stringWithUTF8String:(syms + nameOff)];
+        if (!sym) continue;
+        NSString *t = sym;
+        if ([t hasPrefix:@"_"]) t = [t substringFromIndex:1];
+        if ([t isEqualToString:@"CFHostCreateWithName"])       plan[@(i)] = @0;
+        else if ([t isEqualToString:@"CFHostStartInfoResolution"]) plan[@(i)] = @1;
+        else continue;
+        [names addObject:sym];
+    }
+    if (plan.count == 0) { WTGLog(@"DNS：镜像里没有 CFHost 导入"); return; }
+
+    const struct wtg_starts_in_image *si = (const struct wtg_starts_in_image *)(fix + h->starts_offset);
+    int patched = 0;
+    for (uint32_t seg = 0; seg < si->seg_count; seg++) {
+        uint32_t off = si->seg_info_offset[seg];
+        if (off == 0) continue;
+        const struct wtg_starts_in_segment *ss =
+            (const struct wtg_starts_in_segment *)(((const uint8_t *)si) + off);
+        for (uint16_t pg = 0; pg < ss->page_count; pg++) {
+            uint16_t start = ss->page_start[pg];
+            if (start == 0xFFFF) continue;
+            uintptr_t cur = base + ss->segment_offset + (uintptr_t)pg * ss->page_size + start;
+            for (int guard = 0; guard < 400000; guard++) {
+                uint64_t v = *(volatile uint64_t *)cur;
+                // PTR_64 / PTR_64_OFFSET 家族的 bind 位在 bit63（arm64e 才是 bit62）
+                BOOL isBind = (v >> 63) & 1;
+                uint32_t next = (uint32_t)((v >> 51) & 0xFFF);
+                if (isBind) {
+                    NSNumber *kind = plan[@((uint32_t)(v & 0xFFFFFF))];
+                    if (kind && wtg_addr_in_sections(cur)) {
+                        if (kind.intValue == 0) {
+                            if (!WTGOrigHostCreate) WTGOrigHostCreate = (cfhost_create_t)(uintptr_t)v;
+                            *(uint64_t *)cur = (uint64_t)(uintptr_t)&wtg_host_create;
+                        } else {
+                            if (!WTGOrigHostResolve) WTGOrigHostResolve = (cfhost_resolve_t)(uintptr_t)v;
+                            *(uint64_t *)cur = (uint64_t)(uintptr_t)&wtg_host_resolve;
+                        }
+                        patched++;
+                    }
+                }
+                if (next == 0) break;
+                cur += next * 4;
+            }
+        }
+    }
+    WTGLog(@"DNS：CFHost 槽位打了 %d 个，导入=%@", patched, names);
+}
+
 #pragma mark - 胶囊控制台（仅键盘扩展）
 
 static const void *kChipKey = &kChipKey;
@@ -321,7 +524,7 @@ static const void *kLongKey = &kLongKey;
     CGRect f = [chip.superview convertRect:chip.frame toView:v];
     if (!CGRectContainsPoint(CGRectInset(f, -10, -10), p)) return;
 
-    int next = (WTGAppStageDisplay() + 1) % 4;
+    int next = (WTGAppStageDisplay() + 1) % 5;
     [[NSUserDefaults standardUserDefaults] setInteger:next forKey:kKeyAppStage];
     [[NSUserDefaults standardUserDefaults] synchronize];
     WTGLog(@"主 App stage → S%d（杀掉微信输入法 App 重开生效；键盘本身恒为全开）", next);
@@ -535,12 +738,17 @@ __attribute__((constructor)) static void wtg_init(void) {
                 Class vc = objc_getClass("WBInputViewController");
                 WTGHook(vc, @selector(viewDidLoad), (IMP)g_viewDidLoad, (IMP *)&o_viewDidLoad);
                 WTGHook(vc, @selector(viewDidLayoutSubviews), (IMP)g_viewDidLayout, (IMP *)&o_viewDidLayout);
-                WTGLog(@"键盘扩展：S3 全量拦截已启用");
+                @try { wtg_patch_host_image(); }
+                @catch (NSException *e) { WTGLog(@"DNS 层异常 %@", e); }
+                WTGLog(@"键盘扩展：S4 全量拦截已启用");
             } else {
                 int s = WTGStage();
                 if (s >= 1) { WTGInstallAppHooks(s); }
                 if (s >= 3) { [NSURLProtocol registerClass:[WTGBlockProtocol class]]; }
-                // 注意：主 App 的 S3 不再包含 DNS 层（v3 已移除 interpose）
+                if (s >= 4) {
+                    @try { wtg_patch_host_image(); }
+                    @catch (NSException *e) { WTGLog(@"DNS 层异常 %@", e); }
+                }
                 WTGLog(@"主 App：S%d 已启用（S0=只观测 S1=埋点 S2=URL S3=DNS）", s);
             }
         } @catch (NSException *e) {
