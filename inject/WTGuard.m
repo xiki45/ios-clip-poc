@@ -91,8 +91,13 @@ static void WTGLoadState(void) {
     id en = [d objectForKey:kKeyEnabled];
     atomic_store(&g_enabled, en ? ([en boolValue] ? 1 : 0) : 1);
     id st = [d objectForKey:kKeyAppStage];
-    int s = st ? [st intValue] : 0;
+    int s = st ? [st intValue] : 2;      // S0-S2 已验证可用，新装默认 S2
     atomic_store(&g_stage, MAX(0, MIN(3, s)));
+}
+
+static int WTGAppStageDisplay(void) {
+    id st = [[NSUserDefaults standardUserDefaults] objectForKey:kKeyAppStage];
+    return st ? [st intValue] : 2;
 }
 
 static BOOL WTGOn(void)      { return atomic_load(&g_enabled) != 0; }
@@ -283,7 +288,7 @@ static const void *kLongKey = &kLongKey;
     UILabel *l = [self label];
     if (!l) return;
     UILabel *chip = l;
-    chip.text = [NSString stringWithFormat:@"盾%lu·S%d", (unsigned long)WTGCount, WTGStage()];
+    chip.text = [NSString stringWithFormat:@"盾%lu·A%d", (unsigned long)WTGCount, WTGAppStageDisplay()];
     chip.backgroundColor = WTGOn() ? [UIColor colorWithRed:0.15 green:0.45 blue:0.85 alpha:0.92]
                                    : [UIColor colorWithWhite:0.4 alpha:0.8];
 }
@@ -316,11 +321,10 @@ static const void *kLongKey = &kLongKey;
     CGRect f = [chip.superview convertRect:chip.frame toView:v];
     if (!CGRectContainsPoint(CGRectInset(f, -10, -10), p)) return;
 
-    int next = (WTGStage() + 1) % 4;
+    int next = (WTGAppStageDisplay() + 1) % 4;
     [[NSUserDefaults standardUserDefaults] setInteger:next forKey:kKeyAppStage];
     [[NSUserDefaults standardUserDefaults] synchronize];
-    atomic_store(&g_stage, next);
-    WTGLog(@"主 App stage → S%d（重启微信输入法后生效）", next);
+    WTGLog(@"主 App stage → S%d（杀掉微信输入法 App 重开生效；键盘本身恒为全开）", next);
     [self render];
 }
 
@@ -413,6 +417,28 @@ static void WTGInstallAppHooks(int stage) {
         if (bly) WTGHook(bly, @selector(reportAnalyticsEvent), (IMP)g_noop, NULL);
         Class mt = objc_getClass("WBMetrics");
         if (mt) WTGHook(mt, @selector(uploadDiagnosticZipFile), (IMP)g_noop, NULL);
+        // 崩溃本体也不再外发（含设备信息与堆栈）
+        Class blyMgr = objc_getClass("BLYSDKManager");
+        if (blyMgr) {
+            WTGHook(blyMgr, @selector(reportException:reason:extraInfo:), (IMP)g_noop_3, NULL);
+            WTGHook(blyMgr, @selector(reportError:reason:extraInfo:), (IMP)g_noop_3, NULL);
+        }
+        Class bugly = objc_getClass("Bugly");
+        if (bugly) {
+            WTGHook(bugly, @selector(reportException:), (IMP)g_noop_1, NULL);
+            WTGHook(bugly, @selector(reportError:), (IMP)g_noop_1, NULL);
+        }
+    }
+
+    // Sentry：设置页/反馈页的 JS 错误上报
+    Class hub = objc_getClass("SentryHub");
+    if (hub) {
+        WTGHook(hub, @selector(captureEvent:), (IMP)g_noop_1, NULL);
+        WTGHook(hub, @selector(captureMessage:), (IMP)g_noop_1, NULL);
+    }
+    Class client = objc_getClass("SentryClient");
+    if (client) {
+        WTGHook(client, @selector(captureEnvelope:), (IMP)g_noop_1, NULL);
     }
     WTGLog(@"S%d SDK 埋点 hook 完成", stage);
 }
@@ -464,6 +490,28 @@ static void WTGInstallHooks(void) {
         if (bly) WTGHook(bly, @selector(reportAnalyticsEvent), (IMP)g_noop, NULL);
         Class mt = objc_getClass("WBMetrics");
         if (mt) WTGHook(mt, @selector(uploadDiagnosticZipFile), (IMP)g_noop, NULL);
+        // 崩溃本体也不再外发（含设备信息与堆栈）
+        Class blyMgr = objc_getClass("BLYSDKManager");
+        if (blyMgr) {
+            WTGHook(blyMgr, @selector(reportException:reason:extraInfo:), (IMP)g_noop_3, NULL);
+            WTGHook(blyMgr, @selector(reportError:reason:extraInfo:), (IMP)g_noop_3, NULL);
+        }
+        Class bugly = objc_getClass("Bugly");
+        if (bugly) {
+            WTGHook(bugly, @selector(reportException:), (IMP)g_noop_1, NULL);
+            WTGHook(bugly, @selector(reportError:), (IMP)g_noop_1, NULL);
+        }
+    }
+
+    // Sentry：设置页/反馈页的 JS 错误上报
+    Class hub = objc_getClass("SentryHub");
+    if (hub) {
+        WTGHook(hub, @selector(captureEvent:), (IMP)g_noop_1, NULL);
+        WTGHook(hub, @selector(captureMessage:), (IMP)g_noop_1, NULL);
+    }
+    Class client = objc_getClass("SentryClient");
+    if (client) {
+        WTGHook(client, @selector(captureEnvelope:), (IMP)g_noop_1, NULL);
     }
     WTGLog(@"S1 hook 完成");
 }
