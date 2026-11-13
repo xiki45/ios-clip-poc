@@ -19,7 +19,8 @@ xcrun --sdk iphoneos clang \
     -install_name "@rpath/WeTypeInject.dylib" \
     -o WeTypeInject.dylib \
     WeTypeInject.m \
-    WTClipEngine.m
+    WTClipEngine.m \
+    WTPanelView.m
 
 echo "---- 产物 ----"
 lipo -info WeTypeInject.dylib
