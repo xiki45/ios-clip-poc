@@ -513,7 +513,7 @@ struct wtg_starts_in_segment {
 
 static void wtg_patch_host_image(void) {
     const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(0);
-    if (!mh || mh->magic != MH_MAGIC_64) { WTGLog(@"DNS：取不到主镜像头"); return; }
+    if (!mh || mh->magic != MH_MAGIC_64) { WTGLog(@"[init] DNS：取不到主镜像头"); return; }
     uintptr_t base = (uintptr_t)mh;
 
     uint64_t textVm = 0, leVm = 0, leOff = 0;
@@ -531,15 +531,15 @@ static void wtg_patch_host_image(void) {
         }
         p += lc->cmdsize;
     }
-    if (!cf || !hasLe) { WTGLog(@"DNS：镜像缺 chained fixups / __LINKEDIT，跳过"); return; }
+    if (!cf || !hasLe) { WTGLog(@"[init] DNS：镜像缺 chained fixups / __LINKEDIT，跳过"); return; }
 
     wtg_collect_sections(mh, base, textVm);
-    if (g_secCount == 0) { WTGLog(@"DNS：没找到 __got/__la_symbol_ptr"); return; }
+    if (g_secCount == 0) { WTGLog(@"[init] DNS：没找到 __got/__la_symbol_ptr"); return; }
 
     const uint8_t *fix = (const uint8_t *)(base + (leVm - textVm) + (cf->dataoff - leOff));
     const struct wtg_fixups_header *h = (const struct wtg_fixups_header *)fix;
     if (h->imports_format != 1 && h->imports_format != 3) {
-        WTGLog(@"DNS：imports_format=%u 不支持", h->imports_format);
+        WTGLog(@"[init] DNS：imports_format=%u 不支持", h->imports_format);
         return;
     }
     const uint8_t *imports = fix + h->imports_offset;
@@ -569,7 +569,7 @@ static void wtg_patch_host_image(void) {
         else continue;
         [names addObject:sym];
     }
-    if (plan.count == 0) { WTGLog(@"DNS：镜像里没有 CFHost 导入"); return; }
+    if (plan.count == 0) { WTGLog(@"[init] DNS：镜像里没有 CFHost 导入"); return; }
 
     const struct wtg_starts_in_image *si = (const struct wtg_starts_in_image *)(fix + h->starts_offset);
     int patched = 0;
@@ -620,7 +620,7 @@ static void wtg_patch_host_image(void) {
             }
         }
     }
-    WTGLog(@"DNS：CFHost 槽位打了 %d 个，导入=%@", patched, names);
+    WTGLog(@"[init] 导入槽 patched=%d names=%@", patched, names);
 }
 
 #pragma mark - 胶囊控制台（仅键盘扩展）
@@ -648,12 +648,14 @@ static const void *kLongKey = &kLongKey;
 }
 
 - (void)insertTail {
-    NSString *obs = WTGLinesMatching(@"[obs]", 10);
-    NSString *blocks = WTGLinesMatching(@"拦截 ", 6);
-    NSString *tail = [NSString stringWithFormat:@"%@  ｜ 出网: %@  ｜ 最近拦截: %@",
-                      WTGSummary(), obs.length ? obs : @"(本次没有记录到 NSURLSession 请求)",
+    NSString *init = WTGLinesMatching(@"[init]", 5);
+    NSString *obs = WTGLinesMatching(@"[obs]", 8);
+    NSString *blocks = WTGLinesMatching(@"拦截 ", 4);
+    NSString *tail = [NSString stringWithFormat:@"%@  ｜ init: %@  ｜ 出网: %@  ｜ 最近拦截: %@",
+                      WTGSummary(), init.length ? init : @"-",
+                      obs.length ? obs : @"(没有任何 DNS/连接记录)",
                       blocks.length ? blocks : @"-"];
-    if (tail.length > 1600) tail = [tail substringFromIndex:tail.length - 1600];
+    if (tail.length > 1900) tail = [tail substringFromIndex:tail.length - 1900];
     UIViewController *vc = self.host;
     if (![vc isKindOfClass:[UIInputViewController class]]) return;
     id proxy = [(UIInputViewController *)vc textDocumentProxy];
@@ -717,7 +719,7 @@ static void WTGLayoutChip(UIViewController *vc) {
             objc_setAssociatedObject(container, kTapKey, h, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(container, kLongKey, h, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
-        WTGLog(@"胶囊控制台已装");
+        WTGLog(@"[init] 胶囊控制台已装");
     }
     if (chip.superview != container) [container addSubview:chip];
 
@@ -753,7 +755,7 @@ static void WTGInstallAppHooks(int stage) {
         WTGHook(bb, @selector(reportInstantID:base64Content:), (IMP)g_bb_inst_b, (IMP *)&o_bb_inst_b);
         WTGHook(bb, @selector(updateBuglyUserId:), (IMP)g_bb_bugly, NULL);
     }
-    WTGLog(@"S%d 业务收口 hook 完成", stage);
+    WTGLog(@"[init] S%d 业务收口 hook 完成", stage);
     if (stage < 2) return;
 
     Class rd = objc_getClass("RDeliveyDataReporter");
@@ -798,7 +800,7 @@ static void WTGInstallAppHooks(int stage) {
     if (client) {
         WTGHook(client, @selector(captureEnvelope:), (IMP)g_noop_1, NULL);
     }
-    WTGLog(@"S%d SDK 埋点 hook 完成", stage);
+    WTGLog(@"[init] S%d SDK 埋点 hook 完成", stage);
 }
 
 static void WTGInstallHooks(void) {
@@ -881,7 +883,7 @@ __attribute__((constructor)) static void wtg_init(void) {
         atomic_store(&g_isApp, inApp);
         WTGLoadState();
 
-        WTGLog(@"===== PROBE-1 loaded stage=S%d app=%d path=%@ =====",
+        WTGLog(@"[init] ===== PROBE-1 loaded stage=%d app=%d path=%@ =====",
                WTGStage(), (int)inApp, bundle.lastPathComponent);
 
         @try {
@@ -895,7 +897,7 @@ __attribute__((constructor)) static void wtg_init(void) {
                 WTGHook(vc, @selector(viewDidLayoutSubviews), (IMP)g_viewDidLayout, (IMP *)&o_viewDidLayout);
                 @try { wtg_patch_host_image(); }
                 @catch (NSException *e) { WTGLog(@"DNS 层异常 %@", e); }
-                WTGLog(@"键盘扩展：S4 全量拦截已启用");
+                WTGLog(@"[init] 键盘扩展：S4 全量拦截已启用");
             } else {
                 int s = WTGStage();
                 if (s >= 1) { WTGInstallAppHooks(s); }
@@ -904,7 +906,7 @@ __attribute__((constructor)) static void wtg_init(void) {
                     @try { wtg_patch_host_image(); }
                     @catch (NSException *e) { WTGLog(@"DNS 层异常 %@", e); }
                 }
-                WTGLog(@"主 App：S%d 已启用（S0=只观测 S1=埋点 S2=URL S3=DNS）", s);
+                WTGLog(@"[init] 主 App：S%d 已启用（S0=只观测 S1=埋点 S2=URL S3=DNS）", s);
             }
         } @catch (NSException *e) {
             WTGLog(@"init 异常 %@", e);
