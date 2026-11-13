@@ -1,5 +1,5 @@
 //
-//  WTGuard.m  ·  v2（带分阶段自诊断）
+//  WTGuard.m  ·  v3（去掉 DNS interpose + 分阶段自诊断）
 //
 //  v1 的实测结果：键盘扩展正常（胶囊显示已拦 187 次），但主 App 一开就闪退。
 //  主 App 是我们第一次注入的进程，所以先把「注入本身」和「拦截逻辑」分开验证。
@@ -13,10 +13,9 @@
 //      S0  只加载、只写 PROBE 日志（验证注入与签名）
 //      S1  + ObjC 层埋点 hook（KBIMEMgr / WBBusinessMgr / 各 SDK）
 //      S2  + NSURLProtocol 域名/路径拦截
-//      S3  + getaddrinfo interpose（DNS 层）
+//      S3  + NSURLProtocol（v3 起不再有 DNS interpose，见下方说明）
 //
 //  另外两处加固：
-//      · getaddrinfo 里不再碰 NSUserDefaults（缓存成原子变量），避免早期启动时序问题
 //      · 所有 hook 与构造逻辑都包了 @try
 //
 
@@ -256,39 +255,14 @@ static BOOL WTGPathBlocked(NSURL *url) {
 - (void)stopLoading {}
 @end
 
-#pragma mark - S3：getaddrinfo interpose（不碰 UserDefaults）
+#pragma mark - S3：DNS 拦截已移除（v3）
 
-typedef int (*gai_t)(const char *, const char *, const struct addrinfo *, struct addrinfo **);
-static gai_t WTGRealGAI;
-
-static int wtg_getaddrinfo(const char *node, const char *service,
-                           const struct addrinfo *hints, struct addrinfo **res) {
-    if (!WTGRealGAI) WTGRealGAI = (gai_t)dlsym(RTLD_NEXT, "getaddrinfo");
-    if (!WTGRealGAI) return EAI_FAIL;
-    if (node && WTGStage() >= 3 && WTGOn()) {
-        @try {
-            NSString *host = [NSString stringWithUTF8String:node];
-            if (host) {
-                BOOL fresh = NO;
-                @synchronized (WTGSeen()) {
-                    if (![WTGSeen() containsObject:host]) { [WTGSeen() addObject:host]; fresh = YES; }
-                }
-                if (fresh) WTGLog(@"DNS %@", host);
-                if (WTGHostBlocked(host)) {
-                    WTGHit([NSString stringWithFormat:@"DNS 拦截 %@", host]);
-                    return EAI_NONAME;
-                }
-            }
-        } @catch (NSException *e) {}
-    }
-    return WTGRealGAI(node, service, hints, res);
-}
-
-__attribute__((used, section("__DATA,__interpose")))
-static struct { const void *replacement; const void *replacee; } _wtg_gai = {
-    (const void *)(uintptr_t)&wtg_getaddrinfo,
-    (const void *)(uintptr_t)&getaddrinfo,
-};
+// v1/v2 用 __DATA,__interpose 替换 getaddrinfo，这是主 App 闪退的头号嫌疑：
+//   该 interpose 在 dylib 一被 dyld 加载时就生效（早于 constructor），
+//   而替换函数里要 dlsym(RTLD_NEXT) 取原函数；进程早期解析可能拿到空/错值，
+//   一旦调用就是立刻崩溃 —— 而扩展是在进程跑热之后才加载，所以扩展没事。
+// v3 直接删掉这一层：埋点收口 + NSURLProtocol 已经覆盖绝大部分，
+// 换取「主 App 一定能启动」这个确定性。
 
 #pragma mark - 胶囊控制台（仅键盘扩展）
 
@@ -518,6 +492,7 @@ __attribute__((constructor)) static void wtg_init(void) {
                 int s = WTGStage();
                 if (s >= 1) { WTGInstallAppHooks(s); }
                 if (s >= 3) { [NSURLProtocol registerClass:[WTGBlockProtocol class]]; }
+                // 注意：主 App 的 S3 不再包含 DNS 层（v3 已移除 interpose）
                 WTGLog(@"主 App：S%d 已启用（S0=只观测 S1=埋点 S2=URL S3=DNS）", s);
             }
         } @catch (NSException *e) {
