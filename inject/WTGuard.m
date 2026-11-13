@@ -112,9 +112,38 @@ static BOOL WTGAllowCrash(void) {
 }
 
 static NSUInteger WTGCount = 0;
+static NSMutableDictionary<NSString *, NSNumber *> *WTGIDs(void) {
+    static NSMutableDictionary *d = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ d = [NSMutableDictionary dictionary]; });
+    return d;
+}
+
 static void WTGHit(NSString *what) {
     WTGCount++;
+    // 从 "xxx reportID:content: wt_stat_xxx" 里抠出 reportID 做直方图
+    NSRange r = [what rangeOfString:@" wt_" options:NSBackwardsSearch];
+    if (r.location != NSNotFound) {
+        NSString *rid = [what substringFromIndex:r.location + 1];
+        @synchronized (WTGIDs()) {
+            NSNumber *n = WTGIDs()[rid];
+            WTGIDs()[rid] = @(n.integerValue + 1);
+        }
+    }
     WTGLog(@"拦截 %@ (累计 %lu)", what, (unsigned long)WTGCount);
+}
+
+static NSString *WTGSummary(void) {
+    NSMutableString *m = [NSMutableString string];
+    [m appendFormat:@"—— 拦截汇总：共 %lu 次 / %lu 种 reportID ——", (unsigned long)WTGCount,
+     (unsigned long)WTGIDs().count];
+    NSArray *keys = [WTGIDs() keysSortedByValueUsingComparator:^NSComparisonResult(NSNumber *a, NSNumber *b) {
+        return [b compare:a];
+    }];
+    for (NSString *k in keys) {
+        [m appendFormat:@"%@ x%@", k, WTGIDs()[k]];
+    }
+    return m;
 }
 
 #pragma mark - hook 工具
@@ -247,6 +276,20 @@ static BOOL WTGPathBlocked(NSURL *url) {
     static NSString *const kH = @"WTGHandled";
     if ([NSURLProtocol propertyForKey:kH inRequest:request]) return NO;
     NSURL *u = request.URL;
+
+    // 观测：把真正在出网的 URL 记下来（每个 host+path 只记一次）
+    static NSMutableSet *seen = nil;
+    static dispatch_once_t onceT;
+    dispatch_once(&onceT, ^{ seen = [NSMutableSet set]; });
+    if (u.host.length) {
+        NSString *key = [NSString stringWithFormat:@"%@%@", u.host, u.path ?: @""];
+        @synchronized (seen) {
+            if (![seen containsObject:key] && seen.count < 120) {
+                [seen addObject:key];
+                WTGLog(@"[obs] %@ %@%@", request.HTTPMethod ?: @"GET", u.host, u.path ?: @"");
+            }
+        }
+    }
     if (WTGHostBlocked(u.host)) { WTGHit([NSString stringWithFormat:@"URL 域名 %@", u.host]); return YES; }
     if (WTGPathBlocked(u)) { WTGHit([NSString stringWithFormat:@"URL 路径 %@", u.path]); return YES; }
     return NO;
@@ -290,7 +333,11 @@ typedef Boolean  (*cfhost_resolve_t)(CFHostRef, CFHostInfoType, CFErrorRef *);
 
 static cfhost_create_t  WTGOrigHostCreate;
 static cfhost_resolve_t WTGOrigHostResolve;
-static NSMapTable *WTGHostNames;      // CFHostRef -> CFStringRef(host)
+static uintptr_t g_slotCreate, g_slotResolve;   // 被我们改写的槽位地址（懒绑定会把它们改回去，用完补回）
+
+static void wtg_repatch(void);
+static CFHostRef wtg_host_create(CFAllocatorRef alloc, CFStringRef name);
+static Boolean wtg_host_resolve(CFHostRef host, CFHostInfoType info, CFErrorRef *err);
 
 static NSMapTable *WTGHostMap(void) {
     static NSMapTable *m = nil;
@@ -307,7 +354,13 @@ static CFHostRef wtg_host_create(CFAllocatorRef alloc, CFStringRef name) {
     if (host && name) {
         @synchronized (WTGHostMap()) { [WTGHostMap() setObject:(__bridge id)name forKey:(__bridge id)host]; }
     }
+    wtg_repatch();
     return host;
+}
+
+static void wtg_repatch(void) {
+    if (g_slotCreate)  *(uint64_t *)g_slotCreate  = (uint64_t)(uintptr_t)&wtg_host_create;
+    if (g_slotResolve) *(uint64_t *)g_slotResolve = (uint64_t)(uintptr_t)&wtg_host_resolve;
 }
 
 static Boolean wtg_host_resolve(CFHostRef host, CFHostInfoType info, CFErrorRef *err) {
@@ -331,7 +384,9 @@ static Boolean wtg_host_resolve(CFHostRef host, CFHostInfoType info, CFErrorRef 
             }
         } @catch (NSException *e) {}
     }
-    return WTGOrigHostResolve ? WTGOrigHostResolve(host, info, err) : false;
+    Boolean ok = WTGOrigHostResolve ? WTGOrigHostResolve(host, info, err) : false;
+    wtg_repatch();     // dyld 的懒绑定会把槽位写成真实地址，补回来
+    return ok;
 }
 
 #define WTG_MAX_SEC 24
@@ -456,9 +511,11 @@ static void wtg_patch_host_image(void) {
                     if (kind && wtg_addr_in_sections(cur)) {
                         if (kind.intValue == 0) {
                             if (!WTGOrigHostCreate) WTGOrigHostCreate = (cfhost_create_t)(uintptr_t)v;
+                            g_slotCreate = cur;
                             *(uint64_t *)cur = (uint64_t)(uintptr_t)&wtg_host_create;
                         } else {
                             if (!WTGOrigHostResolve) WTGOrigHostResolve = (cfhost_resolve_t)(uintptr_t)v;
+                            g_slotResolve = cur;
                             *(uint64_t *)cur = (uint64_t)(uintptr_t)&wtg_host_resolve;
                         }
                         patched++;
@@ -497,8 +554,8 @@ static const void *kLongKey = &kLongKey;
 }
 
 - (void)insertTail {
-    NSString *tail = WTGLogTail(15);
-    if (tail.length > 900) tail = [tail substringFromIndex:tail.length - 900];
+    NSString *tail = [WTGSummary() stringByAppendingFormat:@" %@", WTGLogTail(12)];
+    if (tail.length > 1400) tail = [tail substringFromIndex:tail.length - 1400];
     UIViewController *vc = self.host;
     if (![vc isKindOfClass:[UIInputViewController class]]) return;
     id proxy = [(UIInputViewController *)vc textDocumentProxy];
