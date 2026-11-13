@@ -22,9 +22,27 @@ xcrun --sdk iphoneos clang \
     WTClipEngine.m \
     WTPanelView.m
 
+echo "==> 编译隐私守卫 WTGuard.dylib"
+xcrun --sdk iphoneos clang \
+    -arch arm64 \
+    -miphoneos-version-min=15.0 \
+    -fobjc-arc \
+    -dynamiclib \
+    -isysroot "$SDK" \
+    -framework UIKit \
+    -framework Foundation \
+    -framework CoreGraphics \
+    -framework QuartzCore \
+    -install_name "@rpath/WTGuard.dylib" \
+    -o WTGuard.dylib \
+    WTGuard.m
+
 echo "---- 产物 ----"
-lipo -info WeTypeInject.dylib
-otool -L WeTypeInject.dylib | head -6
-codesign --force --sign - --timestamp=none WeTypeInject.dylib
-codesign -dv WeTypeInject.dylib 2>&1 | head -4
-ls -lh WeTypeInject.dylib
+for d in WeTypeInject.dylib WTGuard.dylib; do
+  echo "== $d"
+  lipo -info "$d"
+  otool -L "$d" | head -6
+  codesign --force --sign - --timestamp=none "$d"
+  codesign -dv "$d" 2>&1 | head -4
+  ls -lh "$d"
+done

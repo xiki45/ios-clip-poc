@@ -24,14 +24,16 @@ jobs:
 
       - name: 检查
         run: |
-          file inject/WeTypeInject.dylib
-          nm -gU inject/WeTypeInject.dylib | head -20 || true
+          file inject/WeTypeInject.dylib inject/WTGuard.dylib
+          echo "---- guard interpose 段 ----"
+          otool -s __DATA __interpose inject/WTGuard.dylib | head -12 || true
           echo "---- strings ----"
-          strings inject/WeTypeInject.dylib | grep -E "WBInputViewController|wtinject|INJECT-OK" | head
+          strings inject/WTGuard.dylib | grep -E "wtguard|KBIMEMgr|WBBusinessMgr|trace.qq.com" | head -20
 
       - uses: actions/upload-artifact@v4
         with:
           name: WeTypeInject
           path: |
             inject/WeTypeInject.dylib
+            inject/WTGuard.dylib
           retention-days: 14
