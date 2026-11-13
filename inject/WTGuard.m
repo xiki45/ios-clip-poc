@@ -149,13 +149,13 @@ static void WTGLoadState(void) {
     id en = [d objectForKey:kKeyEnabled];
     atomic_store(&g_enabled, en ? ([en boolValue] ? 1 : 0) : 1);
     id st = [d objectForKey:kKeyAppStage];
-    int s = st ? [st intValue] : 2;      // S0-S2 已验证可用，新装默认 S2
+    int s = st ? [st intValue] : 4;      // A0-A4 全部实测通过；重装会重置 defaults，默认直接给满
     atomic_store(&g_stage, MAX(0, MIN(4, s)));
 }
 
 static int WTGAppStageDisplay(void) {
     id st = [[NSUserDefaults standardUserDefaults] objectForKey:kKeyAppStage];
-    return st ? [st intValue] : 2;
+    return st ? [st intValue] : 4;
 }
 
 static BOOL WTGOn(void)      { return atomic_load(&g_enabled) != 0; }
@@ -392,12 +392,13 @@ typedef Boolean  (*cfhost_resolve_t)(CFHostRef, CFHostInfoType, CFErrorRef *);
 
 static cfhost_create_t  WTGOrigHostCreate;
 static cfhost_resolve_t WTGOrigHostResolve;
-static uintptr_t g_slotCreate, g_slotResolve;   // 被我们改写的槽位地址（懒绑定会把它们改回去，用完补回）
+static uintptr_t g_slotCreate, g_slotResolve, g_slotGAI, g_slotConnect;   // 被我们改写的槽位地址（懒绑定会把它们改回去，用完补回）
 
 typedef int (*gai_t)(const char *, const char *, const struct addrinfo *, struct addrinfo **);
 typedef int (*connect_t)(int, const struct sockaddr *, socklen_t);
 static gai_t     WTGOrigGAI;
 static connect_t WTGOrigConnect;
+static void wtg_repatch(void);
 
 static int wtg_gai(const char *node, const char *service,
                    const struct addrinfo *hints, struct addrinfo **res) {
@@ -418,7 +419,9 @@ static int wtg_gai(const char *node, const char *service,
             }
         }
     }
-    return WTGOrigGAI(node, service, hints, res);
+    int r = WTGOrigGAI(node, service, hints, res);
+    wtg_repatch();
+    return r;
 }
 
 static int wtg_connect(int fd, const struct sockaddr *addr, socklen_t len) {
@@ -448,7 +451,9 @@ static int wtg_connect(int fd, const struct sockaddr *addr, socklen_t len) {
             }
         }
     }
-    return WTGOrigConnect(fd, addr, len);
+    int r = WTGOrigConnect(fd, addr, len);
+    wtg_repatch();
+    return r;
 }
 
 static void wtg_repatch(void);
@@ -477,6 +482,8 @@ static CFHostRef wtg_host_create(CFAllocatorRef alloc, CFStringRef name) {
 static void wtg_repatch(void) {
     if (g_slotCreate)  *(uint64_t *)g_slotCreate  = (uint64_t)(uintptr_t)&wtg_host_create;
     if (g_slotResolve) *(uint64_t *)g_slotResolve = (uint64_t)(uintptr_t)&wtg_host_resolve;
+    if (g_slotGAI)     *(uint64_t *)g_slotGAI     = (uint64_t)(uintptr_t)&wtg_gai;
+    if (g_slotConnect) *(uint64_t *)g_slotConnect = (uint64_t)(uintptr_t)&wtg_connect;
 }
 
 static Boolean wtg_host_resolve(CFHostRef host, CFHostInfoType info, CFErrorRef *err) {
@@ -640,10 +647,12 @@ static void wtg_patch_host_image(void) {
                                 break;
                             case 3:
                                 if (!WTGOrigGAI) WTGOrigGAI = (gai_t)(uintptr_t)v;
+                                g_slotGAI = cur;
                                 *(uint64_t *)cur = (uint64_t)(uintptr_t)&wtg_gai;
                                 break;
                             case 4:
                                 if (!WTGOrigConnect) WTGOrigConnect = (connect_t)(uintptr_t)v;
+                                g_slotConnect = cur;
                                 *(uint64_t *)cur = (uint64_t)(uintptr_t)&wtg_connect;
                                 break;
                             default:
@@ -685,7 +694,11 @@ static const void *kLongKey = &kLongKey;
 }
 
 - (void)insertTail {
-    NSString *init = WTGLinesMatching(@"[init]", 5);
+    NSString *initKb  = WTGLinesMatching(@"[kb] [init]", 3);
+    NSString *initApp = WTGLinesMatching(@"[app] [init]", 3);
+    NSString *init = [@[initKb.length ? [@"kb: " stringByAppendingString:initKb] : @"",
+                        initApp.length ? [@"app: " stringByAppendingString:initApp] : @""]
+                      componentsJoinedByString:@" "];
     NSString *obs = WTGLinesMatching(@"[obs]", 8);
     NSString *blocks = WTGLinesMatching(@"拦截 ", 4);
     unsigned long long sz = [[[NSFileManager defaultManager]
