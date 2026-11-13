@@ -1,5 +1,5 @@
 //
-//  WeTypeInject.m  ·  v7
+//  WeTypeInject.m  ·  v8
 //
 //  阶段 3：把「剪贴板 + 重写」做进微信输入法键盘。
 //
@@ -7,17 +7,22 @@
 //    dylib 能加载 → UI 能加 → window 级手势能收到点击 → insertText 能写字
 //    → 完全访问打开后能读剪贴板
 //
-//  v7 行为：
-//    点右上角「重写」→ 菜单列出当前剪贴板内容可用的算子（推荐在前）
-//    点某一项 → 结果插进光标，菜单关闭
-//    点菜单外面 → 关闭；条目多时最后一行是「更多」
+//  v7 的问题（实测）：菜单能弹出，但点条目没反应。
+//  根因不是坐标，而是状态分裂 —— 按钮的 target 和 window 手势各自持有一个
+//  WTTapHandler 实例，按钮那条路把面板打开了，手势那条路的 _clipText 还是 nil，
+//  于是 applyOption: 一进函数就 return，表现就是「点了没反应」。
 //
-//  点击一律走 window 级手势 + 坐标分发，不依赖按钮/子视图的 hitTest
-//  （这条经验是被 v4/v5 的坑换来的：微信输入法在 vc.view 之上还有东西）。
+//  v8 的改法：
+//    1. 状态收拢到单例 WTMenu —— 按钮、容器手势、面板手势全部打到同一个对象上
+//    2. 同一个动作 0.35s 内只执行一次（按钮与手势会同时触发）
+//    3. 命中表由 WTPanelView 在 reload 时生成，绘制与命中同源
+//    4. 菜单按 POC 风格重做（分区 / 双行 / 翻页脚 / 点按高亮）
+//    5. 去掉「分词」项 —— 微信输入法自带
 //
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <QuartzCore/QuartzCore.h>
 #import "WTClipEngine.h"
 #import "WTPanelView.h"
 
@@ -55,9 +60,7 @@ static void WTLog(NSString *fmt, ...) {
 #pragma mark - 颜色 / 关联键
 
 static const void *kButtonKey  = &kButtonKey;
-static const void *kHandlerKey = &kHandlerKey;
 static const void *kGestureKey = &kGestureKey;
-static const void *kPanelKey   = &kPanelKey;
 
 static UIColor *WTGreen(void) { return [UIColor colorWithRed:0.00 green:0.62 blue:0.42 alpha:1]; }
 static UIColor *WTOrange(void){ return [UIColor colorWithRed:0.95 green:0.52 blue:0.10 alpha:1]; }
@@ -72,7 +75,13 @@ static void WTSetState(UIButton *btn, NSString *title, UIColor *bg) {
     });
 }
 
-#pragma mark - 剪贴板
+static void WTFlash(UIButton *btn, NSString *title, UIColor *bg) {
+    WTSetState(btn, title, bg);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ WTSetState(btn, @"重写", WTGreen()); });
+}
+
+#pragma mark - 剪贴板 / 输入
 
 static NSString *WTClipboardText(void) {
     UIPasteboard *pb = [UIPasteboard generalPasteboard];
@@ -91,7 +100,7 @@ static BOOL WTInsert(UIViewController *vc, NSString *text) {
     return YES;
 }
 
-#pragma mark - 排序：推荐 → 编码 → 文本 → 哈希
+#pragma mark - 排序：推荐 → 编码 → 文本 → 哈希（去掉分词）
 
 static NSArray<WTClipOption *> *WTSortedOptions(NSString *text) {
     NSArray<WTClipOption *> *all = [WTClipEngine optionsForText:text];
@@ -101,13 +110,14 @@ static NSArray<WTClipOption *> *WTSortedOptions(NSString *text) {
     NSMutableSet<NSNumber *> *used = [NSMutableSet set];
 
     for (NSNumber *op in recommended) {
+        if (op.integerValue == WTRewriteOpTokenize) continue;
         for (WTClipOption *o in all) {
             if (o.op == (WTRewriteOp)op.integerValue && ![used containsObject:@(o.op)]) {
                 WTClipOption *copy = [WTClipOption new];
                 copy.op = o.op;
                 copy.title = [@"★ " stringByAppendingString:o.title];
                 copy.detail = o.detail;
-                copy.section = o.section;
+                copy.section = @"推荐";
                 [out addObject:copy];
                 [used addObject:@(o.op)];
                 break;
@@ -116,6 +126,7 @@ static NSArray<WTClipOption *> *WTSortedOptions(NSString *text) {
     }
     for (NSString *sec in @[@"编码", @"文本", @"哈希"]) {
         for (WTClipOption *o in all) {
+            if (o.op == WTRewriteOpTokenize) continue;
             if ([o.section isEqualToString:sec] && ![used containsObject:@(o.op)]) {
                 [out addObject:o];
                 [used addObject:@(o.op)];
@@ -125,57 +136,67 @@ static NSArray<WTClipOption *> *WTSortedOptions(NSString *text) {
     return out;
 }
 
-#pragma mark - 点击处理器
+#pragma mark - 菜单（单例：按钮 / 容器手势 / 面板手势共用同一份状态）
 
-@interface WTTapHandler : NSObject <UIGestureRecognizerDelegate>
+@interface WTMenu : NSObject <UIGestureRecognizerDelegate>
++ (instancetype)shared;
 @property (nonatomic, weak) UIViewController *host;
 @property (nonatomic, weak) UIButton *button;
+- (void)bindHost:(UIViewController *)vc button:(UIButton *)btn;
+- (void)buttonTapped;
+- (void)handleGesture:(UITapGestureRecognizer *)g;
+- (void)relayout;
+- (void)attachTapTo:(UIView *)view;
 @end
 
-@implementation WTTapHandler {
-    NSArray<WTClipOption *> *_allOptions;
+@implementation WTMenu {
     NSString *_clipText;
-    NSInteger _page;
-    BOOL _busy;
+    NSArray<WTClipOption *> *_allOptions;
+    NSInteger _pageStart;
+    WTPanelView *_panel;
+    CFAbsoluteTime _lastActivate;
+    CFAbsoluteTime _lastOpen;
+}
+
++ (instancetype)shared {
+    static WTMenu *menu = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ menu = [WTMenu new]; });
+    return menu;
+}
+
+- (void)bindHost:(UIViewController *)vc button:(UIButton *)btn {
+    if (self.host && self.host != vc) {
+        WTLog(@"键盘实例换了，收起旧面板");
+        [self closePanel];
+    }
+    self.host = vc;
+    self.button = btn;
 }
 
 - (UIView *)container { return self.host.view.window ?: self.host.view; }
 
-- (WTPanelView *)panel { return objc_getAssociatedObject(self.host, kPanelKey); }
+#pragma mark 开关
 
-- (void)closePanel {
-    WTPanelView *p = [self panel];
-    [p removeFromSuperview];
-    objc_setAssociatedObject(self.host, kPanelKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    _allOptions = nil;
-    _page = 0;
-    WTSetState(self.button, @"重写", WTGreen());
-}
-
-- (void)showPage:(NSInteger)page {
-    WTPanelView *panel = [self panel];
-    if (!panel) return;
-    NSInteger perPage = 7;
-    NSInteger start = page * perPage;
-    if (start >= (NSInteger)_allOptions.count) return;
-    NSInteger len = MIN(perPage, (NSInteger)_allOptions.count - start);
-    NSArray *slice = [_allOptions subarrayWithRange:NSMakeRange(start, len)];
-    _page = page;
-    [panel setOptions:slice];
-    [panel layoutIfNeeded];
+- (void)buttonTapped {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - _lastOpen < 0.30) return;   // 手势同帧也会触发，去重
+    _lastOpen = now;
+    if (_panel) [self closePanel];
+    else [self openPanel];
 }
 
 - (void)openPanel {
+    if (!self.host) return;
     NSString *text = WTClipboardText();
     if (text.length == 0) {
         UIPasteboard *pb = [UIPasteboard generalPasteboard];
-        NSString *diag = [NSString stringWithFormat:@"[诊断]items=%lu hasStrings=%d cc=%ld",
-                          (unsigned long)pb.numberOfItems, (int)pb.hasStrings, (long)pb.changeCount];
-        WTLog(@"%@", diag);
-        WTInsert(self.host, diag);
-        WTSetState(self.button, @"读空", WTRed());
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ WTSetState(self.button, @"重写", WTGreen()); });
+        WTLog(@"剪贴板空 items=%lu hasStrings=%d cc=%ld",
+              (unsigned long)pb.numberOfItems, (int)pb.hasStrings, (long)pb.changeCount);
+        WTInsert(self.host, [NSString stringWithFormat:@"[诊断]items=%lu hasStrings=%d cc=%ld",
+                             (unsigned long)pb.numberOfItems, (int)pb.hasStrings,
+                             (long)pb.changeCount]);
+        WTFlash(self.button, @"读空", WTRed());
         return;
     }
 
@@ -184,130 +205,200 @@ static NSArray<WTClipOption *> *WTSortedOptions(NSString *text) {
     WTLog(@"剪贴板 %lu 字，可用算子 %lu 个", (unsigned long)text.length,
           (unsigned long)_allOptions.count);
     if (_allOptions.count == 0) {
+        WTLog(@"没有能生效的算子，直接插入原文");
         WTInsert(self.host, text);
+        WTFlash(self.button, @"无算子", WTOrange());
         return;
     }
 
     UIView *container = [self container];
-    WTPanelView *panel = objc_getAssociatedObject(self.host, kPanelKey);
-    if (!panel) {
-        panel = [WTPanelView new];
-        objc_setAssociatedObject(self.host, kPanelKey, panel, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (!_panel) {
+        _panel = [WTPanelView new];
         __weak typeof(self) weakSelf = self;
-        panel.onMore = ^{
-            __strong typeof(weakSelf) s = weakSelf;
-            if (!s) return;
-            NSInteger next = s->_page + 1;
-            if (next * 7 >= (NSInteger)s->_allOptions.count) next = 0;
-            [s showPage:next];
-        };
+        _panel.onPage = ^(NSInteger start) { [weakSelf goPage:start]; };
+        [self attachTapTo:_panel];
     }
 
     CGRect anchor = [self.host.view convertRect:self.host.view.bounds toView:container];
-    CGFloat w = MIN(anchor.size.width - 16, 420);
-    CGFloat h = MIN(anchor.size.height - 12, 230);
-    panel.frame = CGRectMake(anchor.origin.x + (anchor.size.width - w) / 2,
-                             anchor.origin.y + 6, w, h);
-    [container addSubview:panel];
-    [self showPage:0];
+    CGFloat w = MIN(anchor.size.width - 24, 460);
+    CGFloat maxH = MAX(160, anchor.size.height - 16);
+    _panel.frame = CGRectMake(anchor.origin.x + (anchor.size.width - w) / 2,
+                              anchor.origin.y + 8, w, maxH);
+    _panel.maxHeight = maxH;
+    _panel.sourceLength = (NSInteger)text.length;
+    _panel.options = _allOptions;
+    _panel.pageStart = 0;
+    [_panel reload];
+
+    if (_panel.superview != container) [container addSubview:_panel];
+    [container bringSubviewToFront:_panel];
+
+    _pageStart = 0;
     WTSetState(self.button, @"选择", WTBlue());
-    WTLog(@"菜单已展开 %@", NSStringFromCGRect(panel.frame));
+    WTLog(@"菜单展开 frame=%@ 首屏=%ld/%lu", NSStringFromCGRect(_panel.frame),
+          (long)_panel.shownCount, (unsigned long)_allOptions.count);
 }
 
+- (void)closePanel {
+    [_panel removeFromSuperview];
+    _panel = nil;
+    _clipText = nil;
+    _allOptions = nil;
+    _pageStart = 0;
+    WTSetState(self.button, @"重写", WTGreen());
+}
+
+- (void)goPage:(NSInteger)start {
+    if (!_panel || _allOptions.count == 0) return;
+    _pageStart = MAX(0, MIN(start, (NSInteger)_allOptions.count - 1));
+    _panel.pageStart = _pageStart;
+    [_panel reload];
+    WTLog(@"翻页 pageStart=%ld", (long)_pageStart);
+}
+
+#pragma mark 执行
+
 - (void)applyOption:(WTClipOption *)opt {
-    if (!opt || _clipText.length == 0) return;
+    if (!opt) return;
+    if (_clipText.length == 0) {
+        // 状态万一又错位，这里自愈一次：重读剪贴板，而不是静默失败
+        WTLog(@"!! _clipText 为空，重读剪贴板自愈");
+        _clipText = WTClipboardText();
+        if (_clipText.length == 0) {
+            WTFlash(self.button, @"读空", WTRed());
+            [self closePanel];
+            return;
+        }
+    }
     NSString *err = nil;
     NSString *result = [WTClipEngine applyOp:opt.op toText:_clipText error:&err];
     if (!result) {
         WTLog(@"算子失败 %@: %@", opt.title, err);
-        WTSetState(self.button, @"失败", WTRed());
+        WTFlash(self.button, @"失败", WTRed());
+        [self closePanel];
         return;
     }
     BOOL ok = WTInsert(self.host, result);
-    WTSetState(self.button, ok ? @"✓" : @"✗", ok ? WTGreen() : WTRed());
+    WTLog(@"算子 %@ → 插入 %d", opt.title, (int)ok);
     [self closePanel];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ WTSetState(self.button, @"重写", WTGreen()); });
+    WTFlash(self.button, ok ? @"✓" : @"✗", ok ? WTGreen() : WTRed());
 }
 
-- (void)onDown:(id)sender {
-    WTSetState(self.button, @"①", WTOrange());
+- (void)activateHit:(WTPanelHit *)hit {
+    if (!hit || hit.kind == WTPanelHitKindNone) return;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - _lastActivate < 0.35) return;   // 容器手势 + 面板手势会同一帧各来一次
+    _lastActivate = now;
+
+    [_panel flashRect:hit.rect];
+
+    switch (hit.kind) {
+        case WTPanelHitKindClose:
+            WTLog(@"关闭面板");
+            [self closePanel];
+            break;
+        case WTPanelHitKindPrev:
+            [self goPage:_pageStart - 4];
+            break;
+        case WTPanelHitKindNext:
+            [self goPage:_pageStart + MAX(1, _panel.shownCount)];
+            break;
+        case WTPanelHitKindRow:
+            [self applyOption:hit.option];
+            break;
+        default:
+            break;
+    }
 }
 
-- (void)onTap:(id)sender {
-    [self openPanel];
+#pragma mark 手势
+
+- (void)attachTapTo:(UIView *)view {
+    if (!view) return;
+    if (objc_getAssociatedObject(view, kGestureKey)) return;
+    UITapGestureRecognizer *g = [[UITapGestureRecognizer alloc] initWithTarget:self
+                                                                     action:@selector(handleGesture:)];
+    g.delegate = self;
+    g.cancelsTouchesInView = NO;
+    g.delaysTouchesBegan = NO;
+    g.delaysTouchesEnded = NO;
+    [view addGestureRecognizer:g];
+    objc_setAssociatedObject(view, kGestureKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    WTLog(@"手势挂到 %@", NSStringFromClass([view class]));
 }
 
-- (void)onGesture:(UITapGestureRecognizer *)g {
-    UIView *host = g.view;
-    if (!host) return;
-    CGPoint p = [g locationInView:host];
+- (void)handleGesture:(UITapGestureRecognizer *)g {
+    UIView *view = g.view;
+    if (!view) return;
+    CGPoint p = [g locationInView:view];
 
-    WTPanelView *panel = [self panel];
-    if (panel) {
-        CGRect pf = panel.frame;
-        if (CGRectContainsPoint(pf, p)) {
-            WTClipOption *opt = [panel optionAtPoint:p inView:host];
-            if (opt) [self applyOption:opt];
+    if (_panel && _panel.superview) {
+        CGPoint pp = [_panel convertPoint:p fromView:view];
+        WTPanelHit *hit = [_panel hitAtPoint:pp];
+        if (hit) {
+            WTLog(@"命中 %ld @%@", (long)hit.kind, NSStringFromCGPoint(pp));
+            [self activateHit:hit];
             return;
         }
-        [self closePanel];
+        CGRect pf = [_panel convertRect:_panel.bounds toView:view];
+        if (CGRectContainsPoint(pf, p)) return;   // 面板内空白，不动
+        if (p.x >= 0 && p.y >= 0 && p.x <= view.bounds.size.width && p.y <= view.bounds.size.height) {
+            WTLog(@"面板外点击，收起");
+            [self closePanel];
+        }
         return;
     }
 
     UIButton *btn = self.button;
     if (!btn || !btn.superview) return;
-    CGRect bf = [btn.superview convertRect:btn.frame toView:host];
-    if (CGRectContainsPoint(CGRectInset(bf, -6, -6), p)) [self openPanel];
+    CGRect bf = [btn.superview convertRect:btn.frame toView:view];
+    if (CGRectContainsPoint(CGRectInset(bf, -6, -6), p)) {
+        WTLog(@"命中按钮");
+        [self buttonTapped];
+    }
 }
 
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)g
     shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other {
     return YES;
 }
+
+- (void)relayout {
+    if (!_panel || !self.host) return;
+    UIView *container = [self container];
+    if (_panel.superview != container) return;
+    CGRect anchor = [self.host.view convertRect:self.host.view.bounds toView:container];
+    CGFloat w = MIN(anchor.size.width - 24, 460);
+    CGFloat maxH = MAX(160, anchor.size.height - 16);
+    CGRect f = _panel.frame;
+    f.origin.x = anchor.origin.x + (anchor.size.width - w) / 2;
+    f.origin.y = anchor.origin.y + 8;
+    f.size.width = w;
+    _panel.maxHeight = maxH;
+    _panel.frame = f;
+    [_panel reload];
+    [container bringSubviewToFront:_panel];
+}
+
 @end
 
-#pragma mark - 安装
-
-static UIView *WTContainer(UIViewController *vc) {
-    return vc.view.window ?: vc.view;
-}
+#pragma mark - 安装 / hook
 
 static void WTLayoutButton(UIViewController *vc) {
     UIButton *btn = objc_getAssociatedObject(vc, kButtonKey);
     if (!btn) return;
-    UIView *container = WTContainer(vc);
-    if (btn.superview != container) {
-        [container addSubview:btn];
-    }
+    WTMenu *menu = [WTMenu shared];
+    [menu bindHost:vc button:btn];
+
+    UIView *container = vc.view.window ?: vc.view;
+    if (btn.superview != container) [container addSubview:btn];
     CGRect anchor = [vc.view convertRect:vc.view.bounds toView:container];
     btn.frame = CGRectMake(anchor.origin.x + anchor.size.width - 56,
                            anchor.origin.y + 5, 50, 30);
     [btn.superview bringSubviewToFront:btn];
 
-    WTPanelView *panel = objc_getAssociatedObject(vc, kPanelKey);
-    if (panel && panel.superview == container) {
-        [container bringSubviewToFront:panel];
-    }
-}
-
-static void WTInstallGesture(UIViewController *vc, UIButton *btn) {
-    UIView *container = WTContainer(vc);
-    if (objc_getAssociatedObject(container, kGestureKey)) return;
-
-    WTTapHandler *handler = [WTTapHandler new];
-    handler.host = vc;
-    handler.button = btn;
-
-    UITapGestureRecognizer *g = [[UITapGestureRecognizer alloc] initWithTarget:handler
-                                                                      action:@selector(onGesture:)];
-    g.delegate = handler;
-    g.cancelsTouchesInView = NO;
-    g.delaysTouchesBegan = NO;
-    g.delaysTouchesEnded = NO;
-    [container addGestureRecognizer:g];
-    objc_setAssociatedObject(container, kGestureKey, handler, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    WTLog(@"手势挂到 %@", NSStringFromClass([container class]));
+    [menu attachTapTo:container];
+    [menu relayout];
 }
 
 static void WTInstallButton(UIViewController *vc) {
@@ -321,20 +412,14 @@ static void WTInstallButton(UIViewController *vc) {
         btn.layer.cornerRadius = 8;
         btn.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
 
-        WTTapHandler *handler = [WTTapHandler new];
-        handler.host = vc;
-        handler.button = btn;
-        [btn addTarget:handler action:@selector(onDown:) forControlEvents:UIControlEventTouchDown];
-        [btn addTarget:handler action:@selector(onTap:) forControlEvents:UIControlEventTouchUpInside];
-        objc_setAssociatedObject(btn, kHandlerKey, handler, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        WTMenu *menu = [WTMenu shared];
+        [menu bindHost:vc button:btn];
+        [btn addTarget:menu action:@selector(buttonTapped) forControlEvents:UIControlEventTouchUpInside];
         objc_setAssociatedObject(vc, kButtonKey, btn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         WTLog(@"按钮已装");
     }
     WTLayoutButton(vc);
-    WTInstallGesture(vc, btn);
 }
-
-#pragma mark - hook
 
 static void (*orig_viewDidLoad)(id, SEL);
 static void (*orig_viewDidLayoutSubviews)(id, SEL);
@@ -360,7 +445,7 @@ static void WTSwizzle(Class cls, SEL sel, void *replacement, void **original) {
 }
 
 static void WTInitInner(void) {
-    WTLog(@"===== dylib v7 loaded =====");
+    WTLog(@"===== dylib v8 loaded =====");
     Class cls = objc_getClass("WBInputViewController");
     if (!cls) { WTLog(@"!! 找不到 WBInputViewController"); return; }
     WTSwizzle(cls, @selector(viewDidLoad), (void *)wt_viewDidLoad, (void **)&orig_viewDidLoad);
