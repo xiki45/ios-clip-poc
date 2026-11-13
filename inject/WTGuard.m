@@ -28,6 +28,7 @@
 #import <sys/socket.h>
 #import <dlfcn.h>
 #import <stdatomic.h>
+#import <errno.h>
 #import <QuartzCore/QuartzCore.h>
 
 static NSString *const kGroupID        = @"group.com.tencent.wetype";
@@ -42,17 +43,137 @@ static atomic_bool g_isApp   = false;
 
 #pragma mark - 日志
 
-static NSString *WTGLogPath(void) {
-    static NSString *path = nil;
+// v13：日志路径不再「一次定死」，而是按 grp → tmp → cache → doc 逐个探测，
+// 探到能真正 fopen 的那个才用；同时在进程内留一份环形缓冲，
+// 这样即使文件一个字节都没落地，胶囊里的 init / 出网 / 最近拦截 也照样能看。
+
+static const int kWTGVersion = 13;
+
+static NSString *WTGShort(NSString *l);
+
+static char g_logTag[8] = "none";
+static int  g_logErr = 0;
+static int  g_logCands = 0;
+static unsigned long long g_logBytes = 0;
+static NSString *g_logPath = nil;
+
+// 两个环：g_ringLog 存 init/obs 这类低频诊断行（高频拦截会把它们挤掉），
+//         g_ringHit 只存 "拦截 xxx"，各自独立上限。
+static NSMutableArray<NSString *> *WTGRingLog(void) {
+    static NSMutableArray *a = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ a = [NSMutableArray array]; });
+    return a;
+}
+
+static NSMutableArray<NSString *> *WTGRingHit(void) {
+    static NSMutableArray *a = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ a = [NSMutableArray array]; });
+    return a;
+}
+
+static void WTGRingPush(NSString *line) {
+    BOOL isHit = [line containsString:@"拦截 "];
+    NSMutableArray *a = isHit ? WTGRingHit() : WTGRingLog();
+    NSUInteger cap = isHit ? 24 : 96;
+    @synchronized (a) {
+        [a addObject:line];
+        while (a.count > cap) [a removeObjectAtIndex:0];
+    }
+}
+
+static NSString *WTGRingMatch(NSMutableArray<NSString *> *ring, NSString *needle,
+                              NSUInteger maxLines) {
+    NSMutableArray *picked = [NSMutableArray array];
+    @synchronized (ring) {
+        NSArray *snap = [ring copy];
+        for (NSInteger i = (NSInteger)snap.count - 1; i >= 0 && picked.count < maxLines; i--) {
+            if ([snap[i] containsString:needle]) [picked insertObject:WTGShort(snap[i]) atIndex:0];
+        }
+    }
+    return [picked componentsJoinedByString:@" | "];
+}
+
+// "21:33:01.123 [kb] 正文" → "正文"，并截到 110 字
+static NSString *WTGShort(NSString *l) {
+    NSString *s = l ?: @"";
+    NSRange r = [s rangeOfString:@"] "];
+    if (r.location != NSNotFound) s = [s substringFromIndex:r.location + 2];
+    s = [s stringByTrimmingCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+    if (s.length > 110) s = [s substringToIndex:110];
+    return s;
+}
+
+static NSString *WTGRingMatching(NSString *needle, NSUInteger maxLines) {
+    return WTGRingMatch(WTGRingLog(), needle, maxLines);
+}
+
+static NSString *WTGHitRingMatching(NSUInteger maxLines) {
+    return WTGRingMatch(WTGRingHit(), @"拦截 ", maxLines);
+}
+
+static BOOL WTGProbePath(NSString *path, int *errOut) {
+    NSString *dir = [path stringByDeletingLastPathComponent];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                             withIntermediateDirectories:YES attributes:nil error:NULL];
+    FILE *fp = fopen(path.UTF8String, "a");
+    if (!fp) { if (errOut) *errOut = errno; return NO; }
+    if (fputs("", fp) == EOF) {
+        if (errOut) *errOut = errno ? errno : EIO;
+        fclose(fp);
+        return NO;
+    }
+    fclose(fp);
+    if (errOut) *errOut = 0;
+    return YES;
+}
+
+static void WTGResolveLogPath(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        NSURL *group = [[NSFileManager defaultManager]
-                        containerURLForSecurityApplicationGroupIdentifier:kGroupID];
-        if (group) path = [[group URLByAppendingPathComponent:@"wtguard.log"] path];
-        if (!path) path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"wtguard.log"];
+        NSMutableArray<NSString *> *cands = [NSMutableArray array];
+        NSArray<NSString *> *tags = @[@"grp", @"tmp", @"cache", @"doc"];
+
+        NSURL *grp = [[NSFileManager defaultManager]
+                      containerURLForSecurityApplicationGroupIdentifier:kGroupID];
+        if (grp) [cands addObject:[[grp URLByAppendingPathComponent:@"wtguard.log"] path]];
+        else     [cands addObject:@""];     // 占位，保持 tag 下标对齐
+        [cands addObject:[NSTemporaryDirectory() stringByAppendingPathComponent:@"wtguard.log"]];
+        [cands addObject:[[NSHomeDirectory() stringByAppendingPathComponent:@"Library/Caches"]
+                          stringByAppendingPathComponent:@"wtguard.log"]];
+        [cands addObject:[[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+                          stringByAppendingPathComponent:@"wtguard.log"]];
+
+        g_logCands = (int)cands.count;
+        int lastErr = 0;
+        for (NSUInteger i = 0; i < cands.count; i++) {
+            if (cands[i].length == 0) { lastErr = ESRCH; continue; }
+            int e = 0;
+            if (WTGProbePath(cands[i], &e)) {
+                g_logPath = cands[i];
+                snprintf(g_logTag, sizeof(g_logTag), "%s", [tags[i] UTF8String]);
+                g_logErr = 0;
+                return;
+            }
+            lastErr = e;
+        }
+        g_logPath = nil;
+        g_logErr = lastErr ? lastErr : EIO;
+        snprintf(g_logTag, sizeof(g_logTag), "none");
     });
-    return path;
 }
+
+static NSString *WTGLogPath(void) {
+    WTGResolveLogPath();
+    return g_logPath;
+}
+
+static NSString *WTGLogTag(void) {
+    return [NSString stringWithUTF8String:g_logTag] ?: @"?";
+}
+
+static NSString *WTGReadTail(NSUInteger maxBytes);
 
 static NSMutableSet<NSString *> *WTGSeen(void) {
     static NSMutableSet *set = nil;
@@ -60,8 +181,6 @@ static NSMutableSet<NSString *> *WTGSeen(void) {
     dispatch_once(&once, ^{ set = [NSMutableSet set]; });
     return set;
 }
-
-static NSString *WTGReadTail(NSUInteger maxBytes);
 
 static void WTGLog(NSString *fmt, ...) {
     @autoreleasepool {
@@ -73,30 +192,36 @@ static void WTGLog(NSString *fmt, ...) {
         NSString *line = [NSString stringWithFormat:@"%@ [%@] %@\n",
                           [f stringFromDate:[NSDate date]],
                           atomic_load(&g_isApp) ? @"app" : @"kb", msg];
-        FILE *fp = fopen(WTGLogPath().UTF8String, "a");
-        if (fp) { fputs(line.UTF8String, fp); fclose(fp); }
+        WTGRingPush(line);
+
+        WTGResolveLogPath();
+        if (!g_logPath) return;
+        FILE *fp = fopen(g_logPath.UTF8String, "a");
+        if (!fp) { g_logErr = errno; return; }
+        if (fputs(line.UTF8String, fp) == EOF) g_logErr = errno ? errno : EIO;
+        fclose(fp);
+        g_logBytes = [[[NSFileManager defaultManager] attributesOfItemAtPath:g_logPath
+                                                                      error:NULL] fileSize];
 
         static int counter = 0;
-        if (++counter % 64 == 0) {
-            unsigned long long sz = [[[NSFileManager defaultManager]
-                                      attributesOfItemAtPath:WTGLogPath() error:NULL] fileSize];
-            if (sz > 4 * 1024 * 1024) {
-                NSString *tail = WTGReadTail(512 * 1024);
-                if (tail.length) {
-                    NSArray *ls = [tail componentsSeparatedByString:@"\n"];
-                    NSUInteger keep = MIN(ls.count, (NSUInteger)400);
-                    NSString *cut = [[ls subarrayWithRange:NSMakeRange(ls.count - keep, keep)]
-                                     componentsJoinedByString:@"\n"];
-                    [cut writeToFile:WTGLogPath() atomically:YES
-                            encoding:NSUTF8StringEncoding error:NULL];
-                }
+        if (++counter % 64 == 0 && g_logBytes > 4 * 1024 * 1024) {
+            NSString *tail = WTGReadTail(512 * 1024);
+            if (tail.length) {
+                NSArray *ls = [tail componentsSeparatedByString:@"\n"];
+                NSUInteger keep = MIN(ls.count, (NSUInteger)400);
+                NSString *cut = [[ls subarrayWithRange:NSMakeRange(ls.count - keep, keep)]
+                                 componentsJoinedByString:@"\n"];
+                [cut writeToFile:g_logPath atomically:YES
+                        encoding:NSUTF8StringEncoding error:NULL];
             }
         }
     }
 }
 
 static NSString *WTGReadTail(NSUInteger maxBytes) {
-    NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:WTGLogPath()];
+    NSString *path = WTGLogPath();
+    if (!path) return nil;
+    NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:path];
     if (!fh) return nil;
     NSString *out = nil;
     @try {
@@ -115,24 +240,21 @@ static NSString *WTGReadTail(NSUInteger maxBytes) {
 }
 
 static NSString *WTGLinesMatching(NSString *needle, NSUInteger maxLines) {
-    NSString *all = WTGReadTail(256 * 1024);      // 只看最后 256KB
+    NSString *all = WTGReadTail(256 * 1024);
     if (all.length == 0) return @"";
     NSArray *ls = [all componentsSeparatedByString:@"\n"];
     NSMutableArray *picked = [NSMutableArray array];
-    BOOL any = NO;
     for (NSInteger i = (NSInteger)ls.count - 1; i >= 0 && picked.count < maxLines; i--) {
         NSString *l = ls[i];
-        if ([l containsString:needle]) {
-            NSString *shown = l.length > 96 ? [NSString stringWithFormat:@"…%@", [l substringFromIndex:l.length - 96]] : l;
-            [picked insertObject:shown atIndex:0];
-        }
+        if ([l containsString:needle]) [picked insertObject:WTGShort(l) atIndex:0];
     }
-    (void)any;
     return [picked componentsJoinedByString:@" | "];
 }
 
 static NSString *WTGLogTail(NSUInteger lines) {
-    NSString *all = [NSString stringWithContentsOfFile:WTGLogPath()
+    NSString *path = WTGLogPath();
+    if (!path) return @"(无日志文件)";
+    NSString *all = [NSString stringWithContentsOfFile:path
                                               encoding:NSUTF8StringEncoding
                                                  error:NULL];
     if (all.length == 0) return @"(空日志)";
@@ -193,8 +315,8 @@ static void WTGHit(NSString *what) {
 
 static NSString *WTGSummary(void) {
     NSMutableString *m = [NSMutableString string];
-    [m appendFormat:@"——[%@] 拦截汇总：共 %lu 次 / %lu 种 reportID ——",
-     atomic_load(&g_isApp) ? @"app" : @"kb", (unsigned long)WTGCount,
+    [m appendFormat:@"——[%@]v%d 共 %lu 次 / %lu 种 reportID ——",
+     atomic_load(&g_isApp) ? @"app" : @"kb", kWTGVersion, (unsigned long)WTGCount,
      (unsigned long)WTGIDs().count];
     NSArray *keys = [WTGIDs() keysSortedByValueUsingComparator:^NSComparisonResult(NSNumber *a, NSNumber *b) {
         return [b compare:a];
@@ -618,10 +740,10 @@ static void wtg_patch_host_image(void) {
         uint8_t probe[8] = {0};
         if (imports) memcpy(probe, imports, MIN((size_t)8, (size_t)16));
         WTGLog(@"[init] 槽位解析失败 base=%p textVm=%llx leVm=%llx leOff=%llx dataoff=%u "
-               @"ver=%u ifmt=%u cnt=%u symoff=%u b=%02x%02x%02x%02x",
+               @"ver=%u ifmt=%u cnt=%u symoff=%u secCount=%d b=%02x%02x%02x%02x",
                (void *)(uintptr_t)base, textVm, leVm, leOff, cf->dataoff,
                h->fixups_version, h->imports_format, h->imports_count, h->symbols_offset,
-               probe[0], probe[1], probe[2], probe[3]);
+               g_secCount, probe[0], probe[1], probe[2], probe[3]);
         return;
     }
 
@@ -676,7 +798,10 @@ static void wtg_patch_host_image(void) {
             }
         }
     }
-    WTGLog(@"[init] 导入槽 patched=%d/%lu names=%@", patched, (unsigned long)plan.count, names);
+    WTGLog(@"[init] 导入槽 patched=%d/%lu create=%lu resolve=%lu gai=%lu connect=%lu names=%@",
+           patched, (unsigned long)plan.count,
+           (unsigned long)g_slotCreate, (unsigned long)g_slotResolve,
+           (unsigned long)g_slotGAI, (unsigned long)g_slotConnect, names);
 }
 
 #pragma mark - 胶囊控制台（仅键盘扩展）
@@ -704,27 +829,34 @@ static const void *kLongKey = &kLongKey;
 }
 
 - (void)insertTail {
-    NSString *initKb  = WTGLinesMatching(@"[kb] [init]", 3);
-    NSString *initApp = WTGLinesMatching(@"[app] [init]", 3);
-    NSString *init = [@[initKb.length ? [@"kb: " stringByAppendingString:initKb] : @"",
-                        initApp.length ? [@"app: " stringByAppendingString:initApp] : @""]
-                      componentsJoinedByString:@" "];
-    NSString *obs = WTGLinesMatching(@"[obs]", 8);
-    NSString *blocks = WTGLinesMatching(@"拦截 ", 4);
-    unsigned long long sz = [[[NSFileManager defaultManager]
-                              attributesOfItemAtPath:WTGLogPath() error:NULL] fileSize];
-    NSString *meta = [NSString stringWithFormat:@"log=%lluKB %@", sz / 1024,
-                      [WTGLogPath() lastPathComponent]];
+    // 环形缓冲优先：文件哪怕一个字节都没落地，这三段也一定有内容
+    NSString *initSelf = WTGRingMatching(@"[init]", 3);
+    NSString *initFkb  = WTGLinesMatching(@"[kb] [init]", 2);
+    NSString *initFapp = WTGLinesMatching(@"[app] [init]", 2);
+    NSMutableArray *ip = [NSMutableArray array];
+    if (initSelf.length) [ip addObject:initSelf];
+    if (initFapp.length && ![initSelf containsString:@"主 App"]) [ip addObject:[@"Fapp:" stringByAppendingString:initFapp]];
+    if (initFkb.length && ![initSelf containsString:@"键盘扩展"])  [ip addObject:[@"Fkb:" stringByAppendingString:initFkb]];
+    NSString *init = [ip componentsJoinedByString:@" ∥ "];
+
+    NSString *obs = WTGRingMatching(@"[obs]", 6);
+    if (!obs.length) obs = WTGLinesMatching(@"[obs]", 6);
+    NSString *blocks = WTGHitRingMatching(3);
+    if (!blocks.length) blocks = WTGLinesMatching(@"拦截 ", 3);
+
+    NSString *meta = [NSString stringWithFormat:@"log=%lluKB/%@ e%d %d候选 环%lu",
+                      g_logBytes / 1024, WTGLogTag(), g_logErr, g_logCands,
+                      (unsigned long)(WTGRingLog().count + WTGRingHit().count)];
     NSString *tail = [NSString stringWithFormat:@"%@ ｜ %@ ｜ init: %@ ｜ 出网: %@ ｜ 最近拦截: %@",
                       WTGSummary(), meta, init.length ? init : @"-",
-                      obs.length ? obs : @"(没有任何 DNS/连接记录)",
+                      obs.length ? obs : @"(本进程暂无 DNS/连接记录)",
                       blocks.length ? blocks : @"-"];
     if (tail.length > 1900) tail = [tail substringFromIndex:tail.length - 1900];
     UIViewController *vc = self.host;
     if (![vc isKindOfClass:[UIInputViewController class]]) return;
     id proxy = [(UIInputViewController *)vc textDocumentProxy];
     if ([proxy respondsToSelector:@selector(insertText:)]) [proxy insertText:tail];
-    WTGLog(@"日志尾已插入（15 行）");
+    WTGLog(@"日志尾已插入 v%d", kWTGVersion);
 }
 
 - (void)tap:(UITapGestureRecognizer *)g {
@@ -947,8 +1079,10 @@ __attribute__((constructor)) static void wtg_init(void) {
         atomic_store(&g_isApp, inApp);
         WTGLoadState();
 
-        WTGLog(@"[init] ===== PROBE-1 loaded stage=%d app=%d path=%@ =====",
-               WTGStage(), (int)inApp, bundle.lastPathComponent);
+        WTGResolveLogPath();
+        WTGLog(@"[init] v%d %@ 载入 stage=%d bundle=%@ logpath=%@ tag=%@ errno=%d 候选=%d",
+               kWTGVersion, inApp ? @"app" : @"kb", WTGStage(), bundle.lastPathComponent,
+               g_logPath ?: @"(nil)", WTGLogTag(), g_logErr, g_logCands);
 
         @try {
             if (!inApp) {
