@@ -307,7 +307,8 @@ static void g_noop_bi(id s, SEL c, id a, id b, BOOL v, int i) { g_noop(s, c); }
 static NSArray<NSString *> *WTGBlockedHosts(void) {
     return @[ @"trace.qq.com", @"rqd.qq.com", @"rdelivery.qq.com", @"rconfig.qq.com",
               @"tdos.vip", @"weread.qq.com", @"bugly.qq.com", @"buglybugly.qq.com",
-              @"android.bugly.qq.com" ];
+              @"android.bugly.qq.com",
+              @"rmonitor.qq.com" ];
 }
 
 static BOOL WTGHostBlocked(NSString *host) {
@@ -613,7 +614,16 @@ static void wtg_patch_host_image(void) {
         else continue;
         [names addObject:sym];
     }
-    if (plan.count == 0) { WTGLog(@"[init] DNS：镜像里没有 CFHost 导入"); return; }
+    if (plan.count == 0) {
+        uint8_t probe[8] = {0};
+        if (imports) memcpy(probe, imports, MIN((size_t)8, (size_t)16));
+        WTGLog(@"[init] 槽位解析失败 base=%p textVm=%llx leVm=%llx leOff=%llx dataoff=%u "
+               @"ver=%u ifmt=%u cnt=%u symoff=%u b=%02x%02x%02x%02x",
+               (void *)(uintptr_t)base, textVm, leVm, leOff, cf->dataoff,
+               h->fixups_version, h->imports_format, h->imports_count, h->symbols_offset,
+               probe[0], probe[1], probe[2], probe[3]);
+        return;
+    }
 
     const struct wtg_starts_in_image *si = (const struct wtg_starts_in_image *)(fix + h->starts_offset);
     int patched = 0;
@@ -666,7 +676,7 @@ static void wtg_patch_host_image(void) {
             }
         }
     }
-    WTGLog(@"[init] 导入槽 patched=%d names=%@", patched, names);
+    WTGLog(@"[init] 导入槽 patched=%d/%lu names=%@", patched, (unsigned long)plan.count, names);
 }
 
 #pragma mark - 胶囊控制台（仅键盘扩展）
