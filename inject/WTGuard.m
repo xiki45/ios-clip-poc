@@ -1,24 +1,23 @@
 //
-//  WTGuard.m  ·  v1
+//  WTGuard.m  ·  v2（带分阶段自诊断）
 //
-//  隐私守卫：把微信输入法的「非必要上报」全部掐掉。
+//  v1 的实测结果：键盘扩展正常（胶囊显示已拦 187 次），但主 App 一开就闪退。
+//  主 App 是我们第一次注入的进程，所以先把「注入本身」和「拦截逻辑」分开验证。
 //
-//  三层拦截，越往下越底层：
-//    ① 业务埋点收口（最精准）
-//       - KBIMEMgr  (键盘扩展)  reportID:pb: / reportKeystroke* / reportCandidateClick* …
-//       - WBBusinessMgr (主 App) reportID:content: / doReportID: / reportInstantID: …
-//       这些方法直接 return，包都不会被构造，更不会进队列。
-//    ② 第三方 SDK 埋点
-//       RDelivery / RAFTMeasure / Bugly DAU / BLYAnalytics / MetricKit 诊断包
-//       + WBReportSampleRatioMgr 采样率直接返回 0（就算前面漏了也不会发）
-//    ③ 网络层兜底
-//       - NSURLProtocol：按域名 + 路径拦 HTTP(S)
-//       - getaddrinfo interpose：按域名拦「自己实现 TCP 栈」的那部分（灯塔/RQD/配置）
-//         顺便把解析过的域名写进日志 —— 这是拿来看「还有谁在连」的
+//  v2 的做法：所有拦截按 stage 分级，主 App 默认 stage 0（只写日志，不做任何事）。
+//  键盘上那个胶囊就是控制台：
+//      单击  → 把 wtguard.log 的最后 15 行直接插进当前输入框（不用文件管理器）
+//      长按  → 主 App 的 stage +1（0→1→2→3→0），下次启动 App 生效
 //
-//  只拦上报，不拦功能：云候选、语音识别、剪贴板同步、表情下载、字典更新都放行。
-//  开关：App Group 里的 NSUserDefaults，键 wtguard_enabled（默认 YES）。
-//  键盘上有个小胶囊「盾 N」，点一下切开关，N 是已拦次数。
+//  分阶段含义：
+//      S0  只加载、只写 PROBE 日志（验证注入与签名）
+//      S1  + ObjC 层埋点 hook（KBIMEMgr / WBBusinessMgr / 各 SDK）
+//      S2  + NSURLProtocol 域名/路径拦截
+//      S3  + getaddrinfo interpose（DNS 层）
+//
+//  另外两处加固：
+//      · getaddrinfo 里不再碰 NSUserDefaults（缓存成原子变量），避免早期启动时序问题
+//      · 所有 hook 与构造逻辑都包了 @try
 //
 
 #import <UIKit/UIKit.h>
@@ -26,13 +25,18 @@
 #import <objc/runtime.h>
 #import <netdb.h>
 #import <dlfcn.h>
-#import <sys/socket.h>
+#import <stdatomic.h>
 #import <QuartzCore/QuartzCore.h>
 
-static NSString *const kGroupID      = @"group.com.tencent.wetype";
-static NSString *const kKeyEnabled   = @"wtguard_enabled";
-static NSString *const kKeyAllowCrash   = @"wtguard_allow_crash";    // 允许崩溃上报
-static NSString *const kKeyAllowUploads = @"wtguard_allow_uploads";  // 允许 upload-file/upload-json（反馈包）
+static NSString *const kGroupID        = @"group.com.tencent.wetype";
+static NSString *const kKeyEnabled     = @"wtguard_enabled";
+static NSString *const kKeyAllowCrash  = @"wtguard_allow_crash";
+static NSString *const kKeyAllowUpload = @"wtguard_allow_uploads";
+static NSString *const kKeyAppStage    = @"wtguard_app_stage";
+
+static atomic_int  g_enabled = 1;
+static atomic_int  g_stage   = 0;
+static atomic_bool g_isApp   = false;
 
 #pragma mark - 日志
 
@@ -62,34 +66,48 @@ static void WTGLog(NSString *fmt, ...) {
         va_end(args);
         NSDateFormatter *f = [NSDateFormatter new];
         f.dateFormat = @"HH:mm:ss.SSS";
-        NSString *line = [NSString stringWithFormat:@"%@ [guard] %@\n",
-                          [f stringFromDate:[NSDate date]], msg];
-        NSLog(@"[wtguard] %@", msg);
+        NSString *line = [NSString stringWithFormat:@"%@ [%@] %@\n",
+                          [f stringFromDate:[NSDate date]],
+                          atomic_load(&g_isApp) ? @"app" : @"kb", msg];
         FILE *fp = fopen(WTGLogPath().UTF8String, "a");
         if (fp) { fputs(line.UTF8String, fp); fclose(fp); }
     }
 }
 
-#pragma mark - 开关 / 计数
-
-static BOOL WTGEnabled(void) {
-    id v = [[NSUserDefaults standardUserDefaults] objectForKey:kKeyEnabled];
-    if (!v) return YES;                 // 默认开
-    return [v boolValue];
+static NSString *WTGLogTail(NSUInteger lines) {
+    NSString *all = [NSString stringWithContentsOfFile:WTGLogPath()
+                                              encoding:NSUTF8StringEncoding
+                                                 error:NULL];
+    if (all.length == 0) return @"(空日志)";
+    NSArray *ls = [all componentsSeparatedByString:@"\n"];
+    if (ls.count <= lines) return all;
+    NSArray *tail = [ls subarrayWithRange:NSMakeRange(ls.count - lines, lines)];
+    return [tail componentsJoinedByString:@"\n"];
 }
 
+#pragma mark - 状态
+
+static void WTGLoadState(void) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    id en = [d objectForKey:kKeyEnabled];
+    atomic_store(&g_enabled, en ? ([en boolValue] ? 1 : 0) : 1);
+    id st = [d objectForKey:kKeyAppStage];
+    int s = st ? [st intValue] : 0;
+    atomic_store(&g_stage, MAX(0, MIN(3, s)));
+}
+
+static BOOL WTGOn(void)      { return atomic_load(&g_enabled) != 0; }
+static int  WTGStage(void)   { return atomic_load(&g_stage); }
+static BOOL WTGAllowUploads(void) {
+    id v = [[NSUserDefaults standardUserDefaults] objectForKey:kKeyAllowUpload];
+    return v ? [v boolValue] : NO;
+}
 static BOOL WTGAllowCrash(void) {
     id v = [[NSUserDefaults standardUserDefaults] objectForKey:kKeyAllowCrash];
-    return v ? [v boolValue] : NO;      // 默认也拦
-}
-
-static void WTGSetEnabled(BOOL on) {
-    [[NSUserDefaults standardUserDefaults] setBool:on forKey:kKeyEnabled];
-    [[NSUserDefaults standardUserDefaults] synchronize];
+    return v ? [v boolValue] : NO;
 }
 
 static NSUInteger WTGCount = 0;
-
 static void WTGHit(NSString *what) {
     WTGCount++;
     WTGLog(@"拦截 %@ (累计 %lu)", what, (unsigned long)WTGCount);
@@ -98,279 +116,242 @@ static void WTGHit(NSString *what) {
 #pragma mark - hook 工具
 
 static void WTGHook(Class cls, SEL sel, IMP newImp, IMP *orig) {
-    if (!cls) return;
+    if (!cls || !sel) return;
     Method m = class_getInstanceMethod(cls, sel);
     if (!m) return;
     if (orig) *orig = method_getImplementation(m);
     method_setImplementation(m, newImp);
-    WTGLog(@"hook %@@%@", NSStringFromClass(cls), NSStringFromSelector(sel));
 }
 
-#pragma mark - ① 键盘扩展侧：KBIMEMgr
+#pragma mark - S1：键盘扩展 KBIMEMgr
 
-typedef void (*kb_report_pb_t)(id, SEL, id, id);
-static kb_report_pb_t orig_kb_reportID_pb;
-static kb_report_pb_t orig_kb_reportID_b64;
-static kb_report_pb_t orig_kb_reportInstance_pb;
-static kb_report_pb_t orig_kb_reportStandalone_pb;
+typedef void (*two_id_t)(id, SEL, id, id);
+static two_id_t o_kb_report_pb, o_kb_report_b64, o_kb_report_inst, o_kb_report_sa;
 
-static void wtg_kb_reportID_pb(id self, SEL _cmd, id reportID, id pb) {
-    if (WTGEnabled()) { WTGHit([NSString stringWithFormat:@"KBIMEMgr reportID:pb: %@", reportID]); return; }
-    if (orig_kb_reportID_pb) orig_kb_reportID_pb(self, _cmd, reportID, pb);
+static void g_kb_report_pb(id s, SEL c, id rid, id pb) {
+    if (WTGOn()) { WTGHit([NSString stringWithFormat:@"KBIMEMgr reportID:pb: %@", rid]); return; }
+    if (o_kb_report_pb) o_kb_report_pb(s, c, rid, pb);
+}
+static void g_kb_report_b64(id s, SEL c, id rid, id d) {
+    if (WTGOn()) { WTGHit([NSString stringWithFormat:@"KBIMEMgr reportID:pbBase64Content: %@", rid]); return; }
+    if (o_kb_report_b64) o_kb_report_b64(s, c, rid, d);
+}
+static void g_kb_report_inst(id s, SEL c, id rid, id pb) {
+    if (WTGOn()) { WTGHit([NSString stringWithFormat:@"KBIMEMgr reportInstance:pb: %@", rid]); return; }
+    if (o_kb_report_inst) o_kb_report_inst(s, c, rid, pb);
+}
+static void g_kb_report_sa(id s, SEL c, id rid, id pb) {
+    if (WTGOn()) { WTGHit([NSString stringWithFormat:@"KBIMEMgr reportForStandAloneMode:pb: %@", rid]); return; }
+    if (o_kb_report_sa) o_kb_report_sa(s, c, rid, pb);
+}
+static void g_kb_keystroke(id s, SEL c, id a, unsigned char t, id kc, id content) {
+    if (WTGOn()) WTGHit(@"reportKeystroke(含 keyContent)");
+}
+static void g_kb_keystroke_end(id s, SEL c, id a, unsigned char t, id finalText) {
+    if (WTGOn()) WTGHit(@"reportKeystrokeSessionEnd(含 sessionFinalText)");
+}
+static void g_kb_emoji(id s, SEL c, id a, id b, unsigned long long t, id text) {
+    if (WTGOn()) WTGHit(@"reportEmojiEvent(含 beforeText)");
+}
+static void g_kb_sticker(id s, SEL c, id a, id b, id cand, id last) {
+    if (WTGOn()) WTGHit(@"reportStickerEvent");
+}
+static void g_kb_candclick(id s, SEL c, id a, id b, id cands,
+                           long long v, long long idx, long long src, long long panel,
+                           unsigned long long n) {
+    if (WTGOn()) WTGHit(@"reportCandidateClick(含候选词)");
+}
+static void g_kb_noarg(id s, SEL c) {
+    if (WTGOn()) WTGHit([NSString stringWithFormat:@"KBIMEMgr %@", NSStringFromSelector(c)]);
 }
 
-static void wtg_kb_reportID_b64(id self, SEL _cmd, id reportID, id content) {
-    if (WTGEnabled()) { WTGHit([NSString stringWithFormat:@"KBIMEMgr reportID:pbBase64Content: %@", reportID]); return; }
-    if (orig_kb_reportID_b64) orig_kb_reportID_b64(self, _cmd, reportID, content);
+#pragma mark - S1：主 App WBBusinessMgr
+
+static two_id_t o_bb_rid_c, o_bb_rid_b, o_bb_dorid_b, o_bb_inst_c, o_bb_inst_b;
+
+static void g_bb_rid_c(id s, SEL c, id rid, id v) {
+    if (WTGOn()) { WTGHit([NSString stringWithFormat:@"WBBusinessMgr reportID:content: %@", rid]); return; }
+    if (o_bb_rid_c) o_bb_rid_c(s, c, rid, v);
+}
+static void g_bb_rid_b(id s, SEL c, id rid, id v) {
+    if (WTGOn()) { WTGHit([NSString stringWithFormat:@"WBBusinessMgr reportID:base64Content: %@", rid]); return; }
+    if (o_bb_rid_b) o_bb_rid_b(s, c, rid, v);
+}
+static void g_bb_dorid_b(id s, SEL c, id rid, id v) {
+    if (WTGOn()) { WTGHit([NSString stringWithFormat:@"WBBusinessMgr doReportID:base64Content: %@", rid]); return; }
+    if (o_bb_dorid_b) o_bb_dorid_b(s, c, rid, v);
+}
+static void g_bb_inst_c(id s, SEL c, id rid, id v) {
+    if (WTGOn()) { WTGHit([NSString stringWithFormat:@"WBBusinessMgr reportInstantID:content: %@", rid]); return; }
+    if (o_bb_inst_c) o_bb_inst_c(s, c, rid, v);
+}
+static void g_bb_inst_b(id s, SEL c, id rid, id v) {
+    if (WTGOn()) { WTGHit([NSString stringWithFormat:@"WBBusinessMgr reportInstantID:base64Content: %@", rid]); return; }
+    if (o_bb_inst_b) o_bb_inst_b(s, c, rid, v);
+}
+static void g_bb_bugly(id s, SEL c, unsigned long long uin) {
+    if (WTGOn()) WTGHit(@"WBBusinessMgr updateBuglyUserId");
 }
 
-static void wtg_kb_reportInstance_pb(id self, SEL _cmd, id reportID, id pb) {
-    if (WTGEnabled()) { WTGHit([NSString stringWithFormat:@"KBIMEMgr reportInstance:pb: %@", reportID]); return; }
-    if (orig_kb_reportInstance_pb) orig_kb_reportInstance_pb(self, _cmd, reportID, pb);
+#pragma mark - S1：SDK 埋点
+
+typedef int (*ratio_t)(id, SEL, id);
+static ratio_t o_ratio;
+static int g_ratio(id s, SEL c, id rid) {
+    if (WTGOn()) { WTGHit([NSString stringWithFormat:@"采样拒绝 %@", rid]); return 0; }
+    return o_ratio ? o_ratio(s, c, rid) : 100;
 }
 
-static void wtg_kb_reportStandalone_pb(id self, SEL _cmd, id reportID, id pb) {
-    if (WTGEnabled()) { WTGHit([NSString stringWithFormat:@"KBIMEMgr reportForStandAloneMode:pb: %@", reportID]); return; }
-    if (orig_kb_reportStandalone_pb) orig_kb_reportStandalone_pb(self, _cmd, reportID, pb);
+static void g_noop(id s, SEL c) {
+    if (WTGOn()) WTGHit([NSString stringWithFormat:@"%@ %@", NSStringFromClass([s class]), NSStringFromSelector(c)]);
 }
+static void g_noop_1(id s, SEL c, id a) { g_noop(s, c); }
+static void g_noop_3(id s, SEL c, id a, id b, id d) { g_noop(s, c); }
+static void g_noop_b(id s, SEL c, id a, id b, BOOL v) { g_noop(s, c); }
+static void g_noop_bi(id s, SEL c, id a, id b, BOOL v, int i) { g_noop(s, c); }
 
-// 按键 / 候选词 / 表情：内容类，直接丢
-static void wtg_kb_keystroke(id self, SEL _cmd, id session, unsigned char keyType, id keyCode, id keyContent) {
-    if (WTGEnabled()) { WTGHit(@"KBIMEMgr reportKeystroke (含 keyContent)"); return; }
-}
-
-static void wtg_kb_keystrokeEnd(id self, SEL _cmd, id session, unsigned char trigger, id finalText) {
-    if (WTGEnabled()) { WTGHit(@"KBIMEMgr reportKeystrokeSessionEnd (含 sessionFinalText)"); return; }
-}
-
-static void wtg_kb_emoji(id self, SEL _cmd, id a, id b, unsigned long long c, id d) {
-    if (WTGEnabled()) { WTGHit(@"KBIMEMgr reportEmojiEvent (含 beforeText)"); return; }
-}
-
-static void wtg_kb_sticker(id self, SEL _cmd, id a, id b, id c, id d) {
-    if (WTGEnabled()) { WTGHit(@"KBIMEMgr reportStickerEvent"); return; }
-}
-
-static void wtg_kb_candidateClick(id self, SEL _cmd, id a, id b, id c,
-                                  long long d, long long e, long long f, long long g,
-                                  unsigned long long h) {
-    if (WTGEnabled()) { WTGHit(@"KBIMEMgr reportCandidateClick (含候选词内容)"); return; }
-}
-
-static void wtg_kb_simple(id self, SEL _cmd) {
-    if (WTGEnabled()) { WTGHit([NSString stringWithFormat:@"KBIMEMgr %@", NSStringFromSelector(_cmd)]); return; }
-}
-
-#pragma mark - ① 主 App 侧：WBBusinessMgr
-
-typedef void (*bb_two_id_t)(id, SEL, id, id);
-static bb_two_id_t orig_bb_reportID_content;
-static bb_two_id_t orig_bb_reportID_b64;
-static bb_two_id_t orig_bb_doReportID_b64;
-static bb_two_id_t orig_bb_reportInstant_content;
-static bb_two_id_t orig_bb_reportInstant_b64;
-
-static void wtg_bb_reportID_content(id self, SEL _cmd, id reportID, id content) {
-    if (WTGEnabled()) { WTGHit([NSString stringWithFormat:@"WBBusinessMgr reportID:content: %@", reportID]); return; }
-    if (orig_bb_reportID_content) orig_bb_reportID_content(self, _cmd, reportID, content);
-}
-static void wtg_bb_reportID_b64(id self, SEL _cmd, id reportID, id content) {
-    if (WTGEnabled()) { WTGHit([NSString stringWithFormat:@"WBBusinessMgr reportID:base64Content: %@", reportID]); return; }
-    if (orig_bb_reportID_b64) orig_bb_reportID_b64(self, _cmd, reportID, content);
-}
-static void wtg_bb_doReportID_b64(id self, SEL _cmd, id reportID, id content) {
-    if (WTGEnabled()) { WTGHit([NSString stringWithFormat:@"WBBusinessMgr doReportID:base64Content: %@", reportID]); return; }
-    if (orig_bb_doReportID_b64) orig_bb_doReportID_b64(self, _cmd, reportID, content);
-}
-static void wtg_bb_reportInstant_content(id self, SEL _cmd, id reportID, id content) {
-    if (WTGEnabled()) { WTGHit([NSString stringWithFormat:@"WBBusinessMgr reportInstantID:content: %@", reportID]); return; }
-    if (orig_bb_reportInstant_content) orig_bb_reportInstant_content(self, _cmd, reportID, content);
-}
-static void wtg_bb_reportInstant_b64(id self, SEL _cmd, id reportID, id content) {
-    if (WTGEnabled()) { WTGHit([NSString stringWithFormat:@"WBBusinessMgr reportInstantID:base64Content: %@", reportID]); return; }
-    if (orig_bb_reportInstant_b64) orig_bb_reportInstant_b64(self, _cmd, reportID, content);
-}
-
-// 崩溃/日志不要绑定账号
-static void wtg_bb_updateBuglyUserId(id self, SEL _cmd, unsigned long long uin) {
-    if (WTGEnabled()) { WTGHit(@"WBBusinessMgr updateBuglyUserId (不上报 uin)"); return; }
-}
-
-#pragma mark - ② SDK 埋点
-
-typedef int (*sampleRatio_t)(id, SEL, id);
-static sampleRatio_t orig_sampleRatio;
-static int wtg_sampleRatio(id self, SEL _cmd, id reportID) {
-    if (WTGEnabled()) { WTGHit([NSString stringWithFormat:@"采样拒绝 %@", reportID]); return 0; }
-    return orig_sampleRatio ? orig_sampleRatio(self, _cmd, reportID) : 100;
-}
-
-static void wtg_noop_v(id self, SEL _cmd) {
-    if (WTGEnabled()) WTGHit(NSStringFromClass([self class]));
-}
-
-static void wtg_noop_2id_bool(id self, SEL _cmd, id a, id b, BOOL c) {
-    if (WTGEnabled()) WTGHit([NSString stringWithFormat:@"%@ %@", NSStringFromClass([self class]),
-                             NSStringFromSelector(_cmd)]);
-}
-
-static void wtg_noop_4(id self, SEL _cmd, id a, id b, BOOL c, int d) {
-    if (WTGEnabled()) WTGHit([NSString stringWithFormat:@"%@ %@", NSStringFromClass([self class]),
-                             NSStringFromSelector(_cmd)]);
-}
-
-static void wtg_noop_3(id self, SEL _cmd, id a, id b, id c) {
-    if (WTGEnabled()) WTGHit([NSString stringWithFormat:@"%@ %@", NSStringFromClass([self class]),
-                             NSStringFromSelector(_cmd)]);
-}
-
-static void wtg_noop_id(id self, SEL _cmd, id a) {
-    if (WTGEnabled()) WTGHit([NSString stringWithFormat:@"%@ %@", NSStringFromClass([self class]),
-                             NSStringFromSelector(_cmd)]);
-}
-
-#pragma mark - ③ 网络层：NSURLProtocol
+#pragma mark - S2：NSURLProtocol
 
 static NSArray<NSString *> *WTGBlockedHosts(void) {
-    return @[
-        @"trace.qq.com",            // 灯塔
-        @"rqd.qq.com",              // RQD 网络质量
-        @"rdelivery.qq.com",        // RDelivery 指标
-        @"rconfig.qq.com",          // 配置（上报侧）
-        @"tdos.vip",                // rfix
-        @"weread.qq.com",           // Sentry DSN 落点
-        @"bugly.qq.com",
-        @"buglybugly.qq.com",
-        @"android.bugly.qq.com",
-    ];
+    return @[ @"trace.qq.com", @"rqd.qq.com", @"rdelivery.qq.com", @"rconfig.qq.com",
+              @"tdos.vip", @"weread.qq.com", @"bugly.qq.com", @"buglybugly.qq.com",
+              @"android.bugly.qq.com" ];
 }
 
 static BOOL WTGHostBlocked(NSString *host) {
     if (host.length == 0) return NO;
-    host = host.lowercaseString;
-    for (NSString *h in WTGBlockedHosts()) {
-        if ([host isEqualToString:h] || [host hasSuffix:[@"." stringByAppendingString:h]]) return YES;
+    NSString *h = host.lowercaseString;
+    for (NSString *b in WTGBlockedHosts()) {
+        if ([h isEqualToString:b] || [h hasSuffix:[@"." stringByAppendingString:b]]) return YES;
     }
     return NO;
 }
 
-static BOOL WTGAllowUploads(void) {
-    id v = [[NSUserDefaults standardUserDefaults] objectForKey:kKeyAllowUploads];
-    return v ? [v boolValue] : NO;
-}
-
 static BOOL WTGPathBlocked(NSURL *url) {
-    if (WTGAllowUploads()) return NO;   // 逃生开关：图片/反馈上传走同一条路时打开
+    if (WTGAllowUploads()) return NO;
     NSString *p = url.path.lowercaseString;
     if (p.length == 0) return NO;
-    // 日志/反馈包上传（微信 CDN 上传模板）
     if ([p containsString:@"/upload-file"]) return YES;
-    if ([p containsString:@"/custom/upload-file"]) return YES;
-    if ([p containsString:@"/v1/" ] && [p containsString:@"upload-json"]) return YES;
+    if ([p containsString:@"/v1/"] && [p containsString:@"upload-json"]) return YES;
     return NO;
 }
 
 @interface WTGBlockProtocol : NSURLProtocol @end
-
 @implementation WTGBlockProtocol
-
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
-    if (!WTGEnabled()) return NO;
-    static NSString *const kHandled = @"WTGHandled";
-    if ([NSURLProtocol propertyForKey:kHandled inRequest:request]) return NO;
-    NSURL *url = request.URL;
-    if (WTGHostBlocked(url.host)) {
-        WTGHit([NSString stringWithFormat:@"URL 域名 %@", url.host]);
-        return YES;
-    }
-    if (WTGPathBlocked(url)) {
-        WTGHit([NSString stringWithFormat:@"URL 路径 %@", url.path]);
-        return YES;
-    }
+    if (!WTGOn()) return NO;
+    static NSString *const kH = @"WTGHandled";
+    if ([NSURLProtocol propertyForKey:kH inRequest:request]) return NO;
+    NSURL *u = request.URL;
+    if (WTGHostBlocked(u.host)) { WTGHit([NSString stringWithFormat:@"URL 域名 %@", u.host]); return YES; }
+    if (WTGPathBlocked(u)) { WTGHit([NSString stringWithFormat:@"URL 路径 %@", u.path]); return YES; }
     return NO;
 }
-
-+ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request { return request; }
-
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)r { return r; }
 - (void)startLoading {
-    NSError *err = [NSError errorWithDomain:@"WTGuard" code:-999
-                                   userInfo:@{NSLocalizedDescriptionKey: @"blocked by WTGuard"}];
-    [self.client URLProtocol:self didFailWithError:err];
+    NSError *e = [NSError errorWithDomain:@"WTGuard" code:-999
+                                 userInfo:@{NSLocalizedDescriptionKey: @"blocked"}];
+    [self.client URLProtocol:self didFailWithError:e];
 }
-
 - (void)stopLoading {}
-
 @end
 
-#pragma mark - ③ 网络层：getaddrinfo interpose
+#pragma mark - S3：getaddrinfo interpose（不碰 UserDefaults）
 
-typedef int (*getaddrinfo_t)(const char *, const char *, const struct addrinfo *, struct addrinfo **);
-static getaddrinfo_t WTGRealGetAddrInfo;
+typedef int (*gai_t)(const char *, const char *, const struct addrinfo *, struct addrinfo **);
+static gai_t WTGRealGAI;
 
 static int wtg_getaddrinfo(const char *node, const char *service,
                            const struct addrinfo *hints, struct addrinfo **res) {
-    if (!WTGRealGetAddrInfo) WTGRealGetAddrInfo = (getaddrinfo_t)dlsym(RTLD_NEXT, "getaddrinfo");
-    if (node && WTGEnabled()) {
-        NSString *host = [NSString stringWithUTF8String:node];
-        BOOL fresh = NO;
-        @synchronized (WTGSeen()) {
-            if (![WTGSeen() containsObject:host]) {
-                [WTGSeen() addObject:host];
-                fresh = YES;
+    if (!WTGRealGAI) WTGRealGAI = (gai_t)dlsym(RTLD_NEXT, "getaddrinfo");
+    if (!WTGRealGAI) return EAI_FAIL;
+    if (node && WTGStage() >= 3 && WTGOn()) {
+        @try {
+            NSString *host = [NSString stringWithUTF8String:node];
+            if (host) {
+                BOOL fresh = NO;
+                @synchronized (WTGSeen()) {
+                    if (![WTGSeen() containsObject:host]) { [WTGSeen() addObject:host]; fresh = YES; }
+                }
+                if (fresh) WTGLog(@"DNS %@", host);
+                if (WTGHostBlocked(host)) {
+                    WTGHit([NSString stringWithFormat:@"DNS 拦截 %@", host]);
+                    return EAI_NONAME;
+                }
             }
-        }
-        if (fresh) WTGLog(@"DNS %@", host);   // 顺带留一份「还有谁在连」的清单
-        if (WTGHostBlocked(host)) {
-            WTGHit([NSString stringWithFormat:@"DNS 拦截 %@", host]);
-            return EAI_NONAME;
-        }
+        } @catch (NSException *e) {}
     }
-    return WTGRealGetAddrInfo ? WTGRealGetAddrInfo(node, service, hints, res) : EAI_FAIL;
+    return WTGRealGAI(node, service, hints, res);
 }
 
 __attribute__((used, section("__DATA,__interpose")))
-static struct { const void *replacement; const void *replacee; } _wtg_interpose_getaddrinfo = {
+static struct { const void *replacement; const void *replacee; } _wtg_gai = {
     (const void *)(uintptr_t)&wtg_getaddrinfo,
     (const void *)(uintptr_t)&getaddrinfo,
 };
 
-#pragma mark - 键盘上的小胶囊
+#pragma mark - 胶囊控制台（仅键盘扩展）
 
-static const void *kChipKey    = &kChipKey;
-static const void *kChipGestureKey = &kChipGestureKey;
+static const void *kChipKey = &kChipKey;
+static const void *kTapKey  = &kTapKey;
+static const void *kLongKey = &kLongKey;
 
-@interface WTGChipHandler : NSObject <UIGestureRecognizerDelegate>
+@interface WTGChip : NSObject <UIGestureRecognizerDelegate>
 @property (nonatomic, weak) UIViewController *host;
+- (void)render;
 @end
 
-@implementation WTGChipHandler
+@implementation WTGChip
+
+- (UILabel *)label { return objc_getAssociatedObject(self.host, kChipKey); }
 
 - (void)render {
-    UILabel *chip = objc_getAssociatedObject(self.host, kChipKey);
-    if (!chip) return;
-    BOOL on = WTGEnabled();
-    chip.text = [NSString stringWithFormat:@"盾 %lu", (unsigned long)WTGCount];
-    chip.backgroundColor = on ? [UIColor colorWithRed:0.15 green:0.45 blue:0.85 alpha:0.92]
-                              : [UIColor colorWithWhite:0.35 alpha:0.85];
-    chip.alpha = on ? 1.0 : 0.65;
+    UILabel *l = [self label];
+    if (!l) return;
+    UILabel *chip = l;
+    chip.text = [NSString stringWithFormat:@"盾%lu·S%d", (unsigned long)WTGCount, WTGStage()];
+    chip.backgroundColor = WTGOn() ? [UIColor colorWithRed:0.15 green:0.45 blue:0.85 alpha:0.92]
+                                   : [UIColor colorWithWhite:0.4 alpha:0.8];
+}
+
+- (void)insertTail {
+    NSString *tail = WTGLogTail(15);
+    if (tail.length > 900) tail = [tail substringFromIndex:tail.length - 900];
+    UIViewController *vc = self.host;
+    if (![vc isKindOfClass:[UIInputViewController class]]) return;
+    id proxy = [(UIInputViewController *)vc textDocumentProxy];
+    if ([proxy respondsToSelector:@selector(insertText:)]) [proxy insertText:tail];
+    WTGLog(@"日志尾已插入（15 行）");
 }
 
 - (void)tap:(UITapGestureRecognizer *)g {
-    UIView *v = g.view;
-    UILabel *chip = objc_getAssociatedObject(self.host, kChipKey);
+    UIView *v = g.view; UILabel *chip = [self label];
     if (!v || !chip) return;
     CGPoint p = [g locationInView:v];
     CGRect f = [chip.superview convertRect:chip.frame toView:v];
     if (!CGRectContainsPoint(CGRectInset(f, -8, -8), p)) return;
-    WTGSetEnabled(!WTGEnabled());
-    WTGLog(@"守卫开关 → %@", WTGEnabled() ? @"开" : @"关");
+    [self insertTail];
+    [self render];
+}
+
+- (void)longPress:(UILongPressGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateBegan) return;
+    UIView *v = g.view; UILabel *chip = [self label];
+    if (!v || !chip) return;
+    CGPoint p = [g locationInView:v];
+    CGRect f = [chip.superview convertRect:chip.frame toView:v];
+    if (!CGRectContainsPoint(CGRectInset(f, -10, -10), p)) return;
+
+    int next = (WTGStage() + 1) % 4;
+    [[NSUserDefaults standardUserDefaults] setInteger:next forKey:kKeyAppStage];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    atomic_store(&g_stage, next);
+    WTGLog(@"主 App stage → S%d（重启微信输入法后生效）", next);
     [self render];
 }
 
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)g
-    shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)o {
-    return YES;
-}
+    shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)o { return YES; }
 @end
 
 static void WTGLayoutChip(UIViewController *vc) {
@@ -378,126 +359,171 @@ static void WTGLayoutChip(UIViewController *vc) {
     UILabel *chip = objc_getAssociatedObject(vc, kChipKey);
     if (!chip) {
         chip = [UILabel new];
-        chip.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
+        chip.font = [UIFont systemFontOfSize:10 weight:UIFontWeightSemibold];
         chip.textColor = [UIColor whiteColor];
         chip.textAlignment = NSTextAlignmentCenter;
-        chip.layer.cornerRadius = 8;
+        chip.layer.cornerRadius = 7;
         chip.layer.masksToBounds = YES;
         objc_setAssociatedObject(vc, kChipKey, chip, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-        WTGChipHandler *h = [WTGChipHandler new];
+        WTGChip *h = [WTGChip new];
         h.host = vc;
-        objc_setAssociatedObject(chip, kChipGestureKey, h, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-        UITapGestureRecognizer *g = [[UITapGestureRecognizer alloc] initWithTarget:h action:@selector(tap:)];
-        g.delegate = h;
-        g.cancelsTouchesInView = NO;
-        if (!objc_getAssociatedObject(container, kChipGestureKey)) {
-            [container addGestureRecognizer:g];
-            objc_setAssociatedObject(container, kChipGestureKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:h action:@selector(tap:)];
+        tap.delegate = h; tap.cancelsTouchesInView = NO;
+        UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc]
+                                            initWithTarget:h action:@selector(longPress:)];
+        lp.minimumPressDuration = 0.6; lp.delegate = h; lp.cancelsTouchesInView = NO;
+
+        if (!objc_getAssociatedObject(container, kTapKey)) {
+            [container addGestureRecognizer:tap];
+            [container addGestureRecognizer:lp];
+            objc_setAssociatedObject(container, kTapKey, h, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(container, kLongKey, h, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
-        WTGLog(@"胶囊已装");
+        WTGLog(@"胶囊控制台已装");
     }
     if (chip.superview != container) [container addSubview:chip];
 
     CGRect anchor = [vc.view convertRect:vc.view.bounds toView:container];
-    chip.frame = CGRectMake(anchor.origin.x + 6, anchor.origin.y + 6, 54, 20);
+    chip.frame = CGRectMake(anchor.origin.x + 6, anchor.origin.y + 4, 64, 19);
     [chip.superview bringSubviewToFront:chip];
 
-    WTGChipHandler *h = objc_getAssociatedObject(chip, kChipGestureKey);
+    WTGChip *h = objc_getAssociatedObject(container, kTapKey);
     [h render];
 }
 
 #pragma mark - 安装
 
-static void (*orig_viewDidLoad)(id, SEL);
-static void (*orig_viewDidLayout)(id, SEL);
+static void (*o_viewDidLoad)(id, SEL);
+static void (*o_viewDidLayout)(id, SEL);
 
-static void wtg_viewDidLoad(id self, SEL _cmd) {
-    if (orig_viewDidLoad) orig_viewDidLoad(self, _cmd);
-    @try { WTGLayoutChip((UIViewController *)self); }
-    @catch (NSException *e) { WTGLog(@"chip 异常 %@", e); }
+static void g_viewDidLoad(id self, SEL c) {
+    if (o_viewDidLoad) o_viewDidLoad(self, c);
+    @try { WTGLayoutChip((UIViewController *)self); } @catch (NSException *e) {}
+}
+static void g_viewDidLayout(id self, SEL c) {
+    if (o_viewDidLayout) o_viewDidLayout(self, c);
+    @try { WTGLayoutChip((UIViewController *)self); } @catch (NSException *e) {}
 }
 
-static void wtg_viewDidLayout(id self, SEL _cmd) {
-    if (orig_viewDidLayout) orig_viewDidLayout(self, _cmd);
-    @try { WTGLayoutChip((UIViewController *)self); }
-    @catch (NSException *e) { WTGLog(@"layout 异常 %@", e); }
+static void WTGInstallAppHooks(int stage) {
+    Class bb = objc_getClass("WBBusinessMgr");
+    if (bb) {
+        WTGHook(bb, @selector(reportID:content:), (IMP)g_bb_rid_c, (IMP *)&o_bb_rid_c);
+        WTGHook(bb, @selector(reportID:base64Content:), (IMP)g_bb_rid_b, (IMP *)&o_bb_rid_b);
+        WTGHook(bb, @selector(doReportID:base64Content:), (IMP)g_bb_dorid_b, (IMP *)&o_bb_dorid_b);
+        WTGHook(bb, @selector(reportInstantID:content:), (IMP)g_bb_inst_c, (IMP *)&o_bb_inst_c);
+        WTGHook(bb, @selector(reportInstantID:base64Content:), (IMP)g_bb_inst_b, (IMP *)&o_bb_inst_b);
+        WTGHook(bb, @selector(updateBuglyUserId:), (IMP)g_bb_bugly, NULL);
+    }
+    WTGLog(@"S%d 业务收口 hook 完成", stage);
+    if (stage < 2) return;
+
+    Class rd = objc_getClass("RDeliveyDataReporter");
+    if (rd) WTGHook(rd, @selector(reportEvent:params:forceReport:), (IMP)g_noop_b, NULL);
+    Class raft = objc_getClass("RAFTMeasureService");
+    if (raft) {
+        WTGHook(raft, @selector(reportSuccess:key:success:), (IMP)g_noop_b, NULL);
+        WTGHook(raft, @selector(reportSuccess:key:success:samplingRate:), (IMP)g_noop_bi, NULL);
+        WTGHook(raft, @selector(reportDistribution:key:sValue:), (IMP)g_noop_3, NULL);
+        WTGHook(raft, @selector(reportStartup:), (IMP)g_noop_1, NULL);
+    }
+    if (!WTGAllowCrash()) {
+        Class dau = objc_getClass("BuglyDAUReporter");
+        if (dau) {
+            WTGHook(dau, @selector(reportDAUEvent), (IMP)g_noop, NULL);
+            WTGHook(dau, @selector(reportDAUWithActivateModules:), (IMP)g_noop_1, NULL);
+        }
+        Class bly = objc_getClass("BLYAnalyticsManager");
+        if (bly) WTGHook(bly, @selector(reportAnalyticsEvent), (IMP)g_noop, NULL);
+        Class mt = objc_getClass("WBMetrics");
+        if (mt) WTGHook(mt, @selector(uploadDiagnosticZipFile), (IMP)g_noop, NULL);
+    }
+    WTGLog(@"S%d SDK 埋点 hook 完成", stage);
 }
 
 static void WTGInstallHooks(void) {
     Class kbi = objc_getClass("KBIMEMgr");
     if (kbi) {
-        WTGHook(kbi, @selector(reportID:pb:), (IMP)wtg_kb_reportID_pb, (IMP *)&orig_kb_reportID_pb);
-        WTGHook(kbi, @selector(reportID:pbBase64Content:), (IMP)wtg_kb_reportID_b64, (IMP *)&orig_kb_reportID_b64);
-        WTGHook(kbi, @selector(reportInstance:pb:), (IMP)wtg_kb_reportInstance_pb, (IMP *)&orig_kb_reportInstance_pb);
-        WTGHook(kbi, @selector(reportForStandAloneMode:pb:), (IMP)wtg_kb_reportStandalone_pb, (IMP *)&orig_kb_reportStandalone_pb);
-        WTGHook(kbi, @selector(reportKeystrokeForSession:keyType:keyCode:keyContent:), (IMP)wtg_kb_keystroke, NULL);
-        WTGHook(kbi, @selector(reportKeystrokeSessionEndForSession:triggerType:sessionFinalText:), (IMP)wtg_kb_keystrokeEnd, NULL);
-        WTGHook(kbi, @selector(reportEmojiEvent:session:emojiType:beforeText:), (IMP)wtg_kb_emoji, NULL);
-        WTGHook(kbi, @selector(reportStickerEvent:session:sourceCandidate:lastDisplayCandidate:), (IMP)wtg_kb_sticker, NULL);
-        WTGHook(kbi, @selector(reportCandidateClick:session:candidates:cloudServiceVersion:firstScreenFullVisibleLastCellIndex:hwClickSource:currentPanelType:typingNum:), (IMP)wtg_kb_candidateClick, NULL);
-        WTGHook(kbi, @selector(reportProcessInfo), (IMP)wtg_kb_simple, NULL);
-        WTGHook(kbi, @selector(reportFullAccessStat), (IMP)wtg_kb_simple, NULL);
+        WTGHook(kbi, @selector(reportID:pb:), (IMP)g_kb_report_pb, (IMP *)&o_kb_report_pb);
+        WTGHook(kbi, @selector(reportID:pbBase64Content:), (IMP)g_kb_report_b64, (IMP *)&o_kb_report_b64);
+        WTGHook(kbi, @selector(reportInstance:pb:), (IMP)g_kb_report_inst, (IMP *)&o_kb_report_inst);
+        WTGHook(kbi, @selector(reportForStandAloneMode:pb:), (IMP)g_kb_report_sa, (IMP *)&o_kb_report_sa);
+        WTGHook(kbi, @selector(reportKeystrokeForSession:keyType:keyCode:keyContent:), (IMP)g_kb_keystroke, NULL);
+        WTGHook(kbi, @selector(reportKeystrokeSessionEndForSession:triggerType:sessionFinalText:), (IMP)g_kb_keystroke_end, NULL);
+        WTGHook(kbi, @selector(reportEmojiEvent:session:emojiType:beforeText:), (IMP)g_kb_emoji, NULL);
+        WTGHook(kbi, @selector(reportStickerEvent:session:sourceCandidate:lastDisplayCandidate:), (IMP)g_kb_sticker, NULL);
+        WTGHook(kbi, @selector(reportCandidateClick:session:candidates:cloudServiceVersion:firstScreenFullVisibleLastCellIndex:hwClickSource:currentPanelType:typingNum:), (IMP)g_kb_candclick, NULL);
+        WTGHook(kbi, @selector(reportProcessInfo), (IMP)g_kb_noarg, NULL);
+        WTGHook(kbi, @selector(reportFullAccessStat), (IMP)g_kb_noarg, NULL);
     }
 
     Class bb = objc_getClass("WBBusinessMgr");
     if (bb) {
-        WTGHook(bb, @selector(reportID:content:), (IMP)wtg_bb_reportID_content, (IMP *)&orig_bb_reportID_content);
-        WTGHook(bb, @selector(reportID:base64Content:), (IMP)wtg_bb_reportID_b64, (IMP *)&orig_bb_reportID_b64);
-        WTGHook(bb, @selector(doReportID:base64Content:), (IMP)wtg_bb_doReportID_b64, (IMP *)&orig_bb_doReportID_b64);
-        WTGHook(bb, @selector(reportInstantID:content:), (IMP)wtg_bb_reportInstant_content, (IMP *)&orig_bb_reportInstant_content);
-        WTGHook(bb, @selector(reportInstantID:base64Content:), (IMP)wtg_bb_reportInstant_b64, (IMP *)&orig_bb_reportInstant_b64);
-        WTGHook(bb, @selector(updateBuglyUserId:), (IMP)wtg_bb_updateBuglyUserId, NULL);
+        WTGHook(bb, @selector(reportID:content:), (IMP)g_bb_rid_c, (IMP *)&o_bb_rid_c);
+        WTGHook(bb, @selector(reportID:base64Content:), (IMP)g_bb_rid_b, (IMP *)&o_bb_rid_b);
+        WTGHook(bb, @selector(doReportID:base64Content:), (IMP)g_bb_dorid_b, (IMP *)&o_bb_dorid_b);
+        WTGHook(bb, @selector(reportInstantID:content:), (IMP)g_bb_inst_c, (IMP *)&o_bb_inst_c);
+        WTGHook(bb, @selector(reportInstantID:base64Content:), (IMP)g_bb_inst_b, (IMP *)&o_bb_inst_b);
+        WTGHook(bb, @selector(updateBuglyUserId:), (IMP)g_bb_bugly, NULL);
     }
 
-    Class ratio = objc_getClass("WBReportSampleRatioMgr");
-    if (ratio) {
-        WTGHook(ratio, @selector(sampleRatioForReportID:), (IMP)wtg_sampleRatio, (IMP *)&orig_sampleRatio);
-        WTGHook(ratio, @selector(fetchRatio), (IMP)wtg_noop_v, NULL);
-    }
-
+    // 注：v1 曾把 sampleRatioForReportID: 改成返回 0，怀疑正是主 App 闪退的原因之一
+    // （调用方若把它当除数 / 取模基数就会 SIGFPE）。这里不再动它，靠上面的收口拦就够了。
     Class rd = objc_getClass("RDeliveyDataReporter");
-    if (rd) {
-        WTGHook(rd, @selector(reportEvent:params:forceReport:), (IMP)wtg_noop_2id_bool, NULL);
-    }
+    if (rd) WTGHook(rd, @selector(reportEvent:params:forceReport:), (IMP)g_noop_b, NULL);
     Class raft = objc_getClass("RAFTMeasureService");
     if (raft) {
-        WTGHook(raft, @selector(reportSuccess:key:success:), (IMP)wtg_noop_2id_bool, NULL);
-        WTGHook(raft, @selector(reportSuccess:key:success:samplingRate:), (IMP)wtg_noop_4, NULL);
-        WTGHook(raft, @selector(reportDistribution:key:sValue:), (IMP)wtg_noop_3, NULL);
-        WTGHook(raft, @selector(reportDistribution:key:sValue:samplingRate:), (IMP)wtg_noop_4, NULL);
-        WTGHook(raft, @selector(reportStartup:), (IMP)wtg_noop_id, NULL);
+        WTGHook(raft, @selector(reportSuccess:key:success:), (IMP)g_noop_b, NULL);
+        WTGHook(raft, @selector(reportSuccess:key:success:samplingRate:), (IMP)g_noop_bi, NULL);
+        WTGHook(raft, @selector(reportDistribution:key:sValue:), (IMP)g_noop_3, NULL);
+        WTGHook(raft, @selector(reportStartup:), (IMP)g_noop_1, NULL);
     }
     if (!WTGAllowCrash()) {
         Class dau = objc_getClass("BuglyDAUReporter");
         if (dau) {
-            WTGHook(dau, @selector(reportDAUEvent), (IMP)wtg_noop_v, NULL);
-            WTGHook(dau, @selector(reportDAUWithActivateModules:), (IMP)wtg_noop_id, NULL);
+            WTGHook(dau, @selector(reportDAUEvent), (IMP)g_noop, NULL);
+            WTGHook(dau, @selector(reportDAUWithActivateModules:), (IMP)g_noop_1, NULL);
         }
         Class bly = objc_getClass("BLYAnalyticsManager");
-        if (bly) WTGHook(bly, @selector(reportAnalyticsEvent), (IMP)wtg_noop_v, NULL);
-        Class metrics = objc_getClass("WBMetrics");
-        if (metrics) WTGHook(metrics, @selector(uploadDiagnosticZipFile), (IMP)wtg_noop_v, NULL);
+        if (bly) WTGHook(bly, @selector(reportAnalyticsEvent), (IMP)g_noop, NULL);
+        Class mt = objc_getClass("WBMetrics");
+        if (mt) WTGHook(mt, @selector(uploadDiagnosticZipFile), (IMP)g_noop, NULL);
     }
-
+    WTGLog(@"S1 hook 完成");
 }
 
 __attribute__((constructor)) static void wtg_init(void) {
     @autoreleasepool {
-        WTGLog(@"===== WTGuard v1 loaded (%@) =====",
-               [[NSBundle mainBundle] bundlePath].lastPathComponent);
+        NSString *bundle = [[NSBundle mainBundle] bundlePath];
+        BOOL inApp = [bundle hasSuffix:@".app"];
+        atomic_store(&g_isApp, inApp);
+        WTGLoadState();
+
+        WTGLog(@"===== PROBE-1 loaded stage=S%d app=%d path=%@ =====",
+               WTGStage(), (int)inApp, bundle.lastPathComponent);
+
         @try {
-            [NSURLProtocol registerClass:[WTGBlockProtocol class]];
-            WTGInstallHooks();
-            Class vc = objc_getClass("WBInputViewController");
-            if (vc) {
-                WTGHook(vc, @selector(viewDidLoad), (IMP)wtg_viewDidLoad, (IMP *)&orig_viewDidLoad);
-                WTGHook(vc, @selector(viewDidLayoutSubviews), (IMP)wtg_viewDidLayout, (IMP *)&orig_viewDidLayout);
+            if (!inApp) {
+                // 键盘扩展：一直全开（上一版已验证可用）
+                atomic_store(&g_stage, 3);
+                WTGInstallHooks();
+                [NSURLProtocol registerClass:[WTGBlockProtocol class]];
+                Class vc = objc_getClass("WBInputViewController");
+                WTGHook(vc, @selector(viewDidLoad), (IMP)g_viewDidLoad, (IMP *)&o_viewDidLoad);
+                WTGHook(vc, @selector(viewDidLayoutSubviews), (IMP)g_viewDidLayout, (IMP *)&o_viewDidLayout);
+                WTGLog(@"键盘扩展：S3 全量拦截已启用");
+            } else {
+                int s = WTGStage();
+                if (s >= 1) { WTGInstallAppHooks(s); }
+                if (s >= 3) { [NSURLProtocol registerClass:[WTGBlockProtocol class]]; }
+                WTGLog(@"主 App：S%d 已启用（S0=只观测 S1=埋点 S2=URL S3=DNS）", s);
             }
-            WTGLog(@"启用了 %lu 处拦截", (unsigned long)WTGCount);
         } @catch (NSException *e) {
             WTGLog(@"init 异常 %@", e);
         }
+
+        WTGLog(@"===== PROBE-2 init done =====");
     }
 }
