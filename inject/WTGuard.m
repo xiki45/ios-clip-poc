@@ -61,6 +61,8 @@ static NSMutableSet<NSString *> *WTGSeen(void) {
     return set;
 }
 
+static NSString *WTGReadTail(NSUInteger maxBytes);
+
 static void WTGLog(NSString *fmt, ...) {
     @autoreleasepool {
         va_list args; va_start(args, fmt);
@@ -73,12 +75,47 @@ static void WTGLog(NSString *fmt, ...) {
                           atomic_load(&g_isApp) ? @"app" : @"kb", msg];
         FILE *fp = fopen(WTGLogPath().UTF8String, "a");
         if (fp) { fputs(line.UTF8String, fp); fclose(fp); }
+
+        static int counter = 0;
+        if (++counter % 64 == 0) {
+            unsigned long long sz = [[[NSFileManager defaultManager]
+                                      attributesOfItemAtPath:WTGLogPath() error:NULL] fileSize];
+            if (sz > 4 * 1024 * 1024) {
+                NSString *tail = WTGReadTail(512 * 1024);
+                if (tail.length) {
+                    NSArray *ls = [tail componentsSeparatedByString:@"\n"];
+                    NSUInteger keep = MIN(ls.count, (NSUInteger)400);
+                    NSString *cut = [[ls subarrayWithRange:NSMakeRange(ls.count - keep, keep)]
+                                     componentsJoinedByString:@"\n"];
+                    [cut writeToFile:WTGLogPath() atomically:YES
+                            encoding:NSUTF8StringEncoding error:NULL];
+                }
+            }
+        }
     }
 }
 
+static NSString *WTGReadTail(NSUInteger maxBytes) {
+    NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:WTGLogPath()];
+    if (!fh) return nil;
+    NSString *out = nil;
+    @try {
+        unsigned long long size = [fh seekToEndOfFile];
+        if (size == 0) { [fh closeFile]; return nil; }
+        unsigned long long start = size > maxBytes ? size - maxBytes : 0;
+        [fh seekToFileOffset:start];
+        NSData *d = [fh readDataToEndOfFile];
+        [fh closeFile];
+        if (d.length) {
+            out = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+            if (!out) out = [[NSString alloc] initWithData:d encoding:NSISOLatin1StringEncoding];
+        }
+    } @catch (NSException *e) { out = nil; }
+    return out;
+}
+
 static NSString *WTGLinesMatching(NSString *needle, NSUInteger maxLines) {
-    NSString *all = [NSString stringWithContentsOfFile:WTGLogPath()
-                                              encoding:NSUTF8StringEncoding error:NULL];
+    NSString *all = WTGReadTail(256 * 1024);      // 只看最后 256KB
     if (all.length == 0) return @"";
     NSArray *ls = [all componentsSeparatedByString:@"\n"];
     NSMutableArray *picked = [NSMutableArray array];
@@ -651,8 +688,12 @@ static const void *kLongKey = &kLongKey;
     NSString *init = WTGLinesMatching(@"[init]", 5);
     NSString *obs = WTGLinesMatching(@"[obs]", 8);
     NSString *blocks = WTGLinesMatching(@"拦截 ", 4);
-    NSString *tail = [NSString stringWithFormat:@"%@  ｜ init: %@  ｜ 出网: %@  ｜ 最近拦截: %@",
-                      WTGSummary(), init.length ? init : @"-",
+    unsigned long long sz = [[[NSFileManager defaultManager]
+                              attributesOfItemAtPath:WTGLogPath() error:NULL] fileSize];
+    NSString *meta = [NSString stringWithFormat:@"log=%lluKB %@", sz / 1024,
+                      [WTGLogPath() lastPathComponent]];
+    NSString *tail = [NSString stringWithFormat:@"%@ ｜ %@ ｜ init: %@ ｜ 出网: %@ ｜ 最近拦截: %@",
+                      WTGSummary(), meta, init.length ? init : @"-",
                       obs.length ? obs : @"(没有任何 DNS/连接记录)",
                       blocks.length ? blocks : @"-"];
     if (tail.length > 1900) tail = [tail substringFromIndex:tail.length - 1900];
