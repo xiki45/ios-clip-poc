@@ -19,7 +19,7 @@ CI 里会用 `codesign -d --entitlements` 回读并断言 `group.com.ouo.clipboa
 
 构建记录：<https://github.com/xiki45/ios-clip-poc/actions>
 
-### 0.1 键盘怎么用（v11）
+### 0.1 键盘怎么用（v12）
 
 | 操作 | 效果 |
 |---|---|
@@ -34,7 +34,12 @@ CI 里会用 `codesign -d --entitlements` 回读并断言 `group.com.ouo.clipboa
 
 重写菜单只列**当前内容真的会变**的算子：v9 把「URL 解码 / 美化 JSON / 按行去重」固定列出，对纯文本要么原样返回、要么直接报错，看起来像功能没做。v10 起按内容过滤。
 
-分词（v11 起块感知）：`文本 https://a.com/x?a=1 支付回调 getOrderId` → `文本` / `https://a.com/x?a=1` / `支付` / `回调` / `get` / `order` / `id`。URL、邮箱、日期、版本号整条保留，英文驼峰拆词，中文 2-gram 不重叠。
+**分词已下线（v12）**：分词交给主键盘，本键盘不再切词。过滤词只做「按空格切分 + 大小写不敏感的子串 AND」，
+`支付 回调` 表示两条都要命中。`Tokenizer.swift`（210 行）已删除，换成 40 行的 `TextMatch.swift`。
+
+**重写算子对齐参考实现（v12）**：22 个标准 op 全部具备（补了 HTML 转义/反转义、首字母大写、正则提取、MD5、时间戳→ISO），
+命名统一为 `case_upper` / `case_lower` / `collapse_whitespace`，可以直接跑 `spec-conformance.json` 的一致性用例。
+另有 2 个 iOS 自有算子（加行号、去空行）。
 
 ---
 
