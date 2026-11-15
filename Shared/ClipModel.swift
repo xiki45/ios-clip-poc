@@ -154,6 +154,13 @@ public final class ClipStore {
         return true
     }
 
+    /// 同步用：整表替换（合并结果写回）
+    public func replaceAll(_ newItems: [ClipItem]) {
+        items = newItems
+        reorder()
+        save()
+    }
+
     // MARK: 导入导出
 
     public func exportData() -> Data? {

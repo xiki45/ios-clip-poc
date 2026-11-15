@@ -23,6 +23,9 @@
 		AA00000000000000000000B7 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F5 /* ContentView.swift */; };
 		AA00000000000000000000B8 /* KeyboardViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F6 /* KeyboardViewController.swift */; };
 		AA00000000000000000000B9 /* ClipKeyboard.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000FA /* ClipKeyboard.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		AA0000000000000000000102 /* SyncConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000101 /* SyncConfig.swift */; };
+		AA0000000000000000000104 /* WebDAVClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000103 /* WebDAVClient.swift */; };
+		AA0000000000000000000106 /* SyncEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000105 /* SyncEngine.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -67,6 +70,9 @@
 		AA00000000000000000000FA /* ClipKeyboard.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = ClipKeyboard.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		AA00000000000000000000FC /* PocApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PocApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		AA00000000000000000000FD /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
+		AA0000000000000000000101 /* SyncConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncConfig.swift; sourceTree = "<group>"; };
+		AA0000000000000000000103 /* WebDAVClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebDAVClient.swift; sourceTree = "<group>"; };
+		AA0000000000000000000105 /* SyncEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncEngine.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -116,6 +122,9 @@
 				AA00000000000000000000F3 /* PocApp.swift */,
 				AA00000000000000000000F4 /* AppModel.swift */,
 				AA00000000000000000000F5 /* ContentView.swift */,
+				AA0000000000000000000101 /* SyncConfig.swift */,
+				AA0000000000000000000103 /* WebDAVClient.swift */,
+				AA0000000000000000000105 /* SyncEngine.swift */,
 				AA00000000000000000000FB /* Info.plist */,
 				AA00000000000000000000F9 /* PocApp.entitlements */,
 			);
@@ -248,6 +257,9 @@
 				AA00000000000000000000D6 /* ClipModel.swift in Sources */,
 				AA00000000000000000000D7 /* Rewriter.swift in Sources */,
 				AA00000000000000000000D8 /* TextMatch.swift in Sources */,
+				AA0000000000000000000102 /* SyncConfig.swift in Sources */,
+				AA0000000000000000000104 /* WebDAVClient.swift in Sources */,
+				AA0000000000000000000106 /* SyncEngine.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -22,6 +22,12 @@ final class LibraryModel: ObservableObject {
     @Published var toast: String = ""
     @Published var editing: ClipItem?
 
+    // 同步
+    @Published var syncConfig: SyncConfig = SyncConfigStore.load()
+    @Published var syncing = false
+    @Published var syncStatus: String = "未同步"
+    @Published var lastSync: String = "—"
+
     // 调试信息（原 POC 面板的内容，收进设置页）
     @Published var storagePath: String = ""
     @Published var isShared: Bool = false
@@ -170,6 +176,50 @@ final class LibraryModel: ObservableObject {
               let names = try? FileManager.default.contentsOfDirectory(atPath: url.path),
               !names.isEmpty else { return "未找到 PlugIns（扩展没嵌进来）" }
         return names.joined(separator: ", ")
+    }
+
+    // MARK: - 同步
+
+    func saveSyncConfig() {
+        SyncConfigStore.save(syncConfig)
+        syncStatus = syncConfig.isValid ? "配置已保存" : "还没填服务器地址"
+    }
+
+    /// 在后台跑一次同步，完成后回主线程刷新
+    func runSync() {
+        guard !syncing else { return }
+        guard syncConfig.isValid else { syncStatus = "先填服务器地址"; return }
+        SyncConfigStore.save(syncConfig)
+        syncing = true
+        syncStatus = "开始同步…"
+
+        let cfg = syncConfig
+        let dir = GroupStore.effectiveDirectory?.url
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            guard let dir = dir else {
+                await MainActor.run { self.syncing = false; self.syncStatus = "没有可写目录" }
+                return
+            }
+            let store = ClipStore(directory: dir)
+            do {
+                let engine = try SyncEngine(config: cfg)
+                let summary = try engine.sync(store: store) { step in
+                    Task { @MainActor in self.syncStatus = step }
+                }
+                await MainActor.run {
+                    self.syncing = false
+                    self.syncStatus = summary.text
+                    self.lastSync = Self.fmt.string(from: Date())
+                    self.load()
+                }
+            } catch {
+                await MainActor.run {
+                    self.syncing = false
+                    self.syncStatus = "失败：\(error.localizedDescription)"
+                }
+            }
+        }
     }
 
     // MARK: - 辅助

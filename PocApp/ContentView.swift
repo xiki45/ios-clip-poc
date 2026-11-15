@@ -273,6 +273,40 @@ struct SettingsView: View {
                     row("存储占用", ByteCountFormatter.string(fromByteCount: Int64(model.byteSize), countStyle: .file))
                 }
 
+                Section("同步（WebDAV）") {
+                    TextField("服务器地址，如 https://dav.jianguoyun.com/dav/clip", text: $model.syncConfig.server)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled(true)
+                        .keyboardType(.URL)
+                        .font(.footnote)
+                    TextField("用户名", text: $model.syncConfig.username)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled(true)
+                    SecureField("密码 / 应用密码", text: $model.syncConfig.password)
+                    TextField("设备名", text: $model.syncConfig.deviceName)
+
+                    HStack {
+                        Button {
+                            model.saveSyncConfig()
+                            model.runSync()
+                        } label: {
+                            Label(model.syncing ? "同步中…" : "立即同步", systemImage: "arrow.triangle.2.circlepath")
+                        }
+                        .disabled(model.syncing || !model.syncConfig.isValid)
+
+                        Spacer()
+
+                        Button("保存") { model.saveSyncConfig() }
+                            .font(.footnote)
+                    }
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(model.syncStatus).font(.caption)
+                        Text("上次同步：\(model.lastSync)").font(.caption2).foregroundColor(.secondary)
+                        Text("device: \(model.syncConfig.deviceID.prefix(8))…").font(.caption2).foregroundColor(.secondary)
+                    }
+                }
+
                 Section("存储") {
                     row("共享容器", model.isShared ? "✅ App Group" : "⚠️ 私有沙盒（与键盘不互通）")
                     VStack(alignment: .leading, spacing: 2) {
