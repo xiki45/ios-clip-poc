@@ -19,7 +19,7 @@ CI 里会用 `codesign -d --entitlements` 回读并断言 `group.com.ouo.clipboa
 
 构建记录：<https://github.com/xiki45/ios-clip-poc/actions>
 
-### 0.1 键盘怎么用（v12）
+### 0.1 键盘怎么用（v14）
 
 | 操作 | 效果 |
 |---|---|
@@ -43,6 +43,37 @@ CI 里会用 `codesign -d --entitlements` 回读并断言 `group.com.ouo.clipboa
 
 ---
 
+### 0.2 主 App 怎么了（v13/v14）
+
+原来的 POC 诊断面板已经换成**剪贴板库**：
+
+| 功能 | 位置 |
+|---|---|
+| 搜索（多词空格 AND）+ 7 个分类 chip | 首页 |
+| 左滑复制、右滑置顶/删除 | 列表 |
+| 点条目编辑正文（改完键盘立刻生效） | 编辑页 |
+| 导出 / 导入 JSON（`importMerge` 按 id+rev 归并） | 右上角菜单 |
+| 存储路径、共享状态、扩展清单 | 设置 → 统计/存储/调试 |
+
+**同步（v14）**：设置页里填 WebDAV 地址、账号、设备名，点「立即同步」。
+
+```
+<root>/index.json          清单：items[] + generation + device_id
+<root>/blobs/<sha256>.txt  正文，内容寻址天然去重
+<root>/devices/<id>.json   各设备水位
+```
+
+合并规则与 Python 参考实现一致：rev 大的赢、rev 相等 hash 相同只对齐元数据、
+rev 相等 hash 不同则**双方独立算出同一个结果**（hash 字典序大的胜，输的一方存成
+`<id>-conflict-<hash8>`，rev 都取 max+1），所以两端必然收敛。
+清单用 `If-Match: <etag>` 写，412 就重读重来（最多 3 次）。
+
+本机回归（不需要设备）：
+
+```bash
+work/sync-tests/run.sh     # 起 MiniWebDAV + 跑两台虚拟设备，10 条断言
+```
+
 ## 1. 工程结构
 
 ```
@@ -61,6 +92,13 @@ output/
 ├── Shared/                    # 两个 target 共同编译
 │   ├── GroupStore.swift       # App Group 读写 + JSONL 日志 + 心跳
 │   └── Diagnostics.swift      # 用 SecTask* 探测 entitlement 是否生效
+├── PocApp/
+│   ├── AppModel.swift        # 剪贴板库状态（含同步动作）
+│   ├── ContentView.swift     # 列表 / 编辑 / 设置
+│   ├── SyncConfig.swift      # 同步配置（存 App Group UserDefaults）
+│   ├── WebDAVClient.swift    # 极简 WebDAV 客户端
+│   └── SyncEngine.swift      # 合并 / 推送 / 冲突收敛
+├── work/sync-tests/          # 同步回归（本机可跑，无需设备）
 ├── build-ipa.sh               # 构建 + 写 entitlements + 打 IPA
 ├── docs/POC-CHECKLIST.md      # 逐条验证清单（照着勾）
 └── poc4-dylib/                # 可选：TrollFools 注入用的 dylib 模板
