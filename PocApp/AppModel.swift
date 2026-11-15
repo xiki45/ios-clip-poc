@@ -21,6 +21,7 @@ final class LibraryModel: ObservableObject {
     @Published var filter: Filter = .all
     @Published var toast: String = ""
     @Published var editing: ClipItem?
+    @Published var lastDeleted: ClipItem?
 
     // 同步
     @Published var syncConfig: SyncConfig = SyncConfigStore.load()
@@ -111,14 +112,39 @@ final class LibraryModel: ObservableObject {
 
     func delete(_ item: ClipItem) {
         store?.remove(id: item.id)
+        lastDeleted = item
         load()
         toast = "已删除"
     }
 
+    /// 撤销刚才那一次删除（单级）
+    func undoDelete() {
+        guard let item = lastDeleted else { return }
+        store?.restore(item)
+        lastDeleted = nil
+        load()
+        toast = "已恢复"
+    }
+
     func copy(_ item: ClipItem) {
+        if item.isImage {
+            if let img = image(for: item) {
+                UIPasteboard.general.image = img
+                lastWrite = Self.fmt.string(from: Date())
+                toast = "已复制图片"
+            } else {
+                toast = "图片附件丢了"
+            }
+            return
+        }
         UIPasteboard.general.string = item.text
         lastWrite = Self.fmt.string(from: Date())
         toast = "已复制到剪贴板"
+    }
+
+    func image(for item: ClipItem) -> UIImage? {
+        guard item.isImage, let data = store?.attachmentData(for: item) else { return nil }
+        return UIImage(data: data)
     }
 
     func save(id: String, text: String) {

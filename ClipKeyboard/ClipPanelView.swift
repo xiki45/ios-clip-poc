@@ -152,7 +152,9 @@ final class ClipPanelView: UIView {
         emptyLabel.translatesAutoresizingMaskIntoConstraints = false
         addSubview(emptyLabel)
 
+        thumbWidth = thumbView.widthAnchor.constraint(equalToConstant: 0)
         NSLayoutConstraint.activate([
+            thumbWidth,
             filterBar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
             filterBar.trailingAnchor.constraint(equalTo: close.leadingAnchor, constant: -4),
             filterBar.topAnchor.constraint(equalTo: topAnchor, constant: 4),
@@ -316,7 +318,7 @@ extension ClipPanelView: UITableViewDataSource, UITableViewDelegate {
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
         let cell = tableView.dequeueReusableCell(withIdentifier: "cell", for: indexPath) as! ClipCell
         let item = items[indexPath.row]
-        cell.configure(with: item, query: query)
+        cell.configure(with: item, query: query, store: store)
 
         cell.rewriteButton.menu = menu(for: item)
         cell.rewriteButton.showsMenuAsPrimaryAction = true
@@ -346,6 +348,8 @@ final class ClipCell: UITableViewCell {
     private let previewLabel = UILabel()
     private let metaLabel = UILabel()
     private let pinIcon = UIImageView(image: UIImage(systemName: "pin.fill"))
+    private let thumbView = UIImageView()
+    private var thumbWidth: NSLayoutConstraint!
     let rewriteButton = UIButton(type: .system)
 
     override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
@@ -365,10 +369,18 @@ final class ClipCell: UITableViewCell {
         pinIcon.translatesAutoresizingMaskIntoConstraints = false
         pinIcon.isHidden = true
 
+        thumbView.contentMode = .scaleAspectFill
+        thumbView.clipsToBounds = true
+        thumbView.layer.cornerRadius = 4
+        thumbView.backgroundColor = .tertiarySystemFill
+        thumbView.translatesAutoresizingMaskIntoConstraints = false
+        thumbView.isHidden = true
+
         rewriteButton.setImage(UIImage(systemName: "wand.and.stars"), for: .normal)
         rewriteButton.tintColor = .systemBlue
         rewriteButton.translatesAutoresizingMaskIntoConstraints = false
 
+        contentView.addSubview(thumbView)
         contentView.addSubview(previewLabel)
         contentView.addSubview(metaLabel)
         contentView.addSubview(pinIcon)
@@ -380,7 +392,11 @@ final class ClipCell: UITableViewCell {
             rewriteButton.widthAnchor.constraint(equalToConstant: 40),
             rewriteButton.heightAnchor.constraint(equalToConstant: 40),
 
-            previewLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 12),
+            thumbView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 12),
+            thumbView.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
+            thumbView.heightAnchor.constraint(equalToConstant: 36),
+
+            previewLabel.leadingAnchor.constraint(equalTo: thumbView.trailingAnchor, constant: 8),
             previewLabel.trailingAnchor.constraint(equalTo: rewriteButton.leadingAnchor, constant: -6),
             previewLabel.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 8),
 
@@ -397,14 +413,28 @@ final class ClipCell: UITableViewCell {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    func configure(with item: ClipItem, query: String) {
-        previewLabel.text = item.preview
+    func configure(with item: ClipItem, query: String, store: ClipStore?) {
+        previewLabel.text = item.isImage ? "图片" : item.preview
         pinIcon.isHidden = !item.pinned
+
+        if item.isImage, let data = store?.attachmentData(for: item), let img = UIImage(data: data) {
+            thumbView.image = img
+            thumbView.isHidden = false
+            thumbWidth.constant = 36
+        } else {
+            thumbView.image = nil
+            thumbView.isHidden = true
+            thumbWidth.constant = 0
+        }
 
         let f = DateFormatter()
         f.dateFormat = "MM-dd HH:mm"
-        var meta = "\(item.kind) · \(f.string(from: item.updatedAt))"
-        if item.text.count > 120 { meta += " · \(item.text.count) 字" }
+        var meta = "\(item.isImage ? "图片" : item.kind) · \(f.string(from: item.updatedAt))"
+        if item.isImage {
+            if let px = item.pixelSize { meta += " · \(px)" }
+        } else if item.text.count > 120 {
+            meta += " · \(item.text.count) 字"
+        }
         metaLabel.text = meta
     }
 }

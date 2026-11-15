@@ -89,6 +89,17 @@ final class KeyboardViewController: UIInputViewController {
         let pb = UIPasteboard.general
         guard pb.changeCount != lastChangeCount else { return }
         lastChangeCount = pb.changeCount
+
+        // 图片优先：复制图片时 pb.string 通常为空
+        if pb.hasImages, let img = pb.image, let data = img.pngData() {
+            let px = "\(Int(img.size.width * img.scale))×\(Int(img.size.height * img.scale))"
+            if let item = store?.upsertImage(data, source: "keyboard", pixel: px) {
+                panel.reload()
+                updateStatus("已记录图片 \(item.pixelSize ?? "")")
+            }
+            return
+        }
+
         guard let text = pb.string, !text.isEmpty else { return }
         store?.upsert(text, source: "keyboard")
         panel.reload()
@@ -147,6 +158,17 @@ final class KeyboardViewController: UIInputViewController {
     // MARK: - 动作
 
     private func insert(_ item: ClipItem) {
+        // 图片没法用 insertText 塞进输入框，只能放回系统剪贴板让用户粘贴
+        if item.isImage {
+            if let data = store?.attachmentData(for: item), let img = UIImage(data: data) {
+                UIPasteboard.general.image = img
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                updateStatus("图片已复制，长按输入框粘贴")
+            } else {
+                updateStatus("图片读不出来（附件丢了）")
+            }
+            return
+        }
         ignoreNextContextRefresh = true
         textDocumentProxy.insertText(item.text)
         updateStatus("已插入 \(item.text.count) 字")

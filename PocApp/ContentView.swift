@@ -54,11 +54,18 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showSettings) { SettingsView(model: model) }
             .sheet(item: $model.editing) { item in
-                EditItemView(item: item) { text in
-                    model.save(id: item.id, text: text)
-                    model.editing = nil
-                } onCancel: {
-                    model.editing = nil
+                if item.isImage {
+                    ImagePreviewView(image: model.image(for: item),
+                                     pixel: item.pixelSize,
+                                     onCopy: { model.copy(item); model.editing = nil },
+                                     onClose: { model.editing = nil })
+                } else {
+                    EditItemView(item: item) { text in
+                        model.save(id: item.id, text: text)
+                        model.editing = nil
+                    } onCancel: {
+                        model.editing = nil
+                    }
                 }
             }
             .sheet(item: Binding(
@@ -81,14 +88,20 @@ struct ContentView: View {
                       secondaryButton: .cancel(Text("取消")))
             }
             .overlay(alignment: .bottom) {
-                if !model.toast.isEmpty {
-                    Text(model.toast)
-                        .font(.footnote)
-                        .padding(.horizontal, 14).padding(.vertical, 8)
-                        .background(.ultraThinMaterial, in: Capsule())
-                        .padding(.bottom, 12)
-                        .transition(.opacity)
+                HStack(spacing: 8) {
+                    if !model.toast.isEmpty {
+                        Text(model.toast)
+                    }
+                    if model.lastDeleted != nil {
+                        Button("撤销") { model.undoDelete() }
+                            .font(.footnote.bold())
+                    }
                 }
+                .font(.footnote)
+                .padding(.horizontal, 14).padding(.vertical, 8)
+                .background(.ultraThinMaterial, in: Capsule())
+                .padding(.bottom, 12)
+                .opacity(model.toast.isEmpty && model.lastDeleted == nil ? 0 : 1)
             }
             .onChange(of: model.toast) { t in
                 guard !t.isEmpty else { return }
@@ -142,7 +155,7 @@ struct ContentView: View {
         } else {
             List {
                 ForEach(model.items, id: \.id) { item in
-                    ItemRow(item: item, onCopy: { model.copy(item) })
+                    ItemRow(item: item, thumb: model.image(for: item), onCopy: { model.copy(item) })
                         .contentShape(Rectangle())
                         .onTapGesture { model.editing = item }
                         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
@@ -170,10 +183,19 @@ struct ContentView: View {
 
 struct ItemRow: View {
     let item: ClipItem
+    let thumb: UIImage?
     let onCopy: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        HStack(alignment: .top, spacing: 10) {
+            if let thumb = thumb {
+                Image(uiImage: thumb)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: 44, height: 44)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+            }
+            VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
                 if item.pinned {
                     Image(systemName: "pin.fill").font(.caption2).foregroundColor(.orange)
@@ -191,8 +213,9 @@ struct ItemRow: View {
                 .font(.callout)
                 .lineLimit(3)
                 .foregroundColor(.primary)
-            Text("\(item.text.count) 字 · \(item.source) · rev\(item.rev)")
+            Text("\(item.isImage ? (item.pixelSize ?? "图片") : "\(item.text.count) 字") · \(item.source) · rev\(item.rev)")
                 .font(.caption2).foregroundColor(.secondary)
+            }
         }
         .padding(.vertical, 3)
         .contextMenu {
@@ -219,12 +242,16 @@ struct EditItemView: View {
     let onCancel: () -> Void
 
     @State private var text: String
+    @State private var past: [String] = []
+    @State private var prevText: String
+    @State private var pending: DispatchWorkItem?
 
     init(item: ClipItem, onSave: @escaping (String) -> Void, onCancel: @escaping () -> Void) {
         self.item = item
         self.onSave = onSave
         self.onCancel = onCancel
         _text = State(initialValue: item.text)
+        _prevText = State(initialValue: item.text)
     }
 
     var body: some View {
@@ -233,9 +260,25 @@ struct EditItemView: View {
                 TextEditor(text: $text)
                     .font(.body.monospaced())
                     .padding(8)
+                    .onChange(of: text) { newValue in
+                        // 停手 0.8s 才记一个撤销点，避免每个字符都进栈
+                        pending?.cancel()
+                        let work = DispatchWorkItem {
+                            guard prevText != newValue else { return }
+                            past.append(prevText)
+                            if past.count > 50 { past.removeFirst() }
+                            prevText = newValue
+                        }
+                        pending = work
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8, execute: work)
+                    }
+
                 Divider()
                 HStack {
                     Text("\(text.count) 字")
+                    if !past.isEmpty {
+                        Text("· 可撤销 \(past.count) 步").foregroundColor(.secondary)
+                    }
                     Spacer()
                     Text("rev \(item.rev)")
                 }
@@ -245,12 +288,68 @@ struct EditItemView: View {
             .navigationTitle("编辑")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button {
+                        guard let last = past.popLast() else { return }
+                        pending?.cancel()
+                        text = last
+                        prevText = last
+                    } label: {
+                        Label("撤销", systemImage: "arrow.uturn.backward")
+                    }
+                    .disabled(past.isEmpty)
+                }
                 ToolbarItem(placement: .cancellationAction) {
                     Button("取消", action: onCancel)
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("保存") { onSave(text) }
                         .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
+        .navigationViewStyle(.stack)
+    }
+}
+
+// MARK: - 图片预览
+
+struct ImagePreviewView: View {
+    let image: UIImage?
+    let pixel: String?
+    let onCopy: () -> Void
+    let onClose: () -> Void
+
+    var body: some View {
+        NavigationView {
+            VStack(spacing: 14) {
+                if let image = image {
+                    Image(uiImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(maxHeight: 420)
+                        .background(Color(.secondarySystemBackground))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                } else {
+                    Text("图片附件丢了").foregroundColor(.secondary)
+                }
+                if let p = pixel {
+                    Text(p).font(.caption).foregroundColor(.secondary)
+                }
+                Button {
+                    onCopy()
+                } label: {
+                    Label("复制到剪贴板", systemImage: "doc.on.doc")
+                }
+                .buttonStyle(.borderedProminent)
+                Spacer()
+            }
+            .padding()
+            .navigationTitle("图片")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("完成", action: onClose)
                 }
             }
         }

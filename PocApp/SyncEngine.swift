@@ -74,7 +74,7 @@ public final class SyncEngine {
 
             progress("合并")
             var byID = Dictionary(uniqueKeysWithValues: store.items.map { ($0.id, $0) })
-            try merge(remote: remoteRows, into: &byID, summary: &summary)
+            try merge(remote: remoteRows, store: store, into: &byID, summary: &summary)
 
             progress("写回本地")
             store.replaceAll(Array(byID.values))
@@ -98,7 +98,13 @@ public final class SyncEngine {
             for item in store.items {
                 let rrev = remoteRevByID[item.id] ?? -1
                 guard item.rev > rrev, !item.deleted else { continue }
-                _ = try client.putText("blobs/\(item.hash).txt", item.text)
+                if item.isImage {
+                    if let data = store.attachmentData(for: item) {
+                        _ = try client.putData("blobs/\(item.hash).bin", data)
+                    }
+                } else {
+                    _ = try client.putText("blobs/\(item.hash).txt", item.text)
+                }
                 summary.pushed += 1
             }
 
@@ -132,6 +138,7 @@ public final class SyncEngine {
     // MARK: - 合并
 
     private func merge(remote: [[String: Any]],
+                       store: ClipStore,
                        into byID: inout [String: ClipItem],
                        summary: inout SyncSummary) throws {
         for row in remote {
@@ -142,12 +149,15 @@ public final class SyncEngine {
             let rpin = (row["pinned"] as? Bool) ?? false
             let rsrc = (row["source"] as? String) ?? "remote"
             let rdate = Self.parseDate(row["updated_at"] as? String) ?? Date()
+            let rtype = (row["type"] as? String) ?? "text"
+            let rpixel = (row["pixel"] as? String) ?? ""
+            let remoteIsImage = (rtype == "image")
 
             if var local = byID[id] {
                 if rrev > local.rev {
-                    if !rdel, let text = try client.getText("blobs/\(rhash).txt") {
-                        local.text = text
-                        local.hash = rhash
+                    if !rdel {
+                        try pullContent(hash: rhash, isImage: remoteIsImage, pixel: rpixel,
+                                        store: store, into: &local)
                     }
                     local.rev = rrev
                     local.deleted = rdel
@@ -166,14 +176,11 @@ public final class SyncEngine {
                         let newRev = max(local.rev, rrev) + 1
                         let localWins = local.hash > rhash
                         var winner = local
-                        var loser = local
-                        if !localWins {
-                            if !rdel, let text = try client.getText("blobs/\(rhash).txt") {
-                                winner.text = text
-                                winner.hash = rhash
-                            }
-                            loser = local
+                        if !localWins, !rdel {
+                            try pullContent(hash: rhash, isImage: remoteIsImage, pixel: rpixel,
+                                            store: store, into: &winner)
                         }
+                        var loser = local
                         winner.rev = newRev
                         loser.id = "\(id)-conflict-\(localWins ? String(rhash.prefix(8)) : String(local.hash.prefix(8)))"
                         loser.rev = newRev
@@ -191,15 +198,39 @@ public final class SyncEngine {
                 item.deleted = rdel
                 item.pinned = rpin
                 item.updatedAt = rdate
-                if !rdel, let text = try client.getText("blobs/\(rhash).txt") {
-                    item.text = text
-                    item.hash = rhash
-                } else {
-                    item.hash = rhash
+                item.hash = rhash
+                if !rdel {
+                    try pullContent(hash: rhash, isImage: remoteIsImage, pixel: rpixel,
+                                    store: store, into: &item)
                 }
                 byID[id] = item
                 summary.pulled += 1
             }
+        }
+    }
+
+    /// 按类型把远端正文/图片落到本地
+    private func pullContent(hash: String,
+                             isImage: Bool,
+                             pixel: String,
+                             store: ClipStore,
+                             into item: inout ClipItem) throws {
+        if isImage {
+            guard let data = try client.getData("blobs/\(hash).bin") else { return }
+            let name = "\(hash).png"
+            if store.writeAttachment(named: name, data: data) {
+                item.type = "image"
+                item.attachment = name
+                item.pixelSize = pixel.isEmpty ? nil : pixel
+                item.text = "［图片］" + pixel
+                item.hash = hash
+            }
+        } else if let text = try client.getText("blobs/\(hash).txt") {
+            item.text = text
+            item.type = nil
+            item.attachment = nil
+            item.pixelSize = nil
+            item.hash = hash
         }
     }
 
@@ -213,6 +244,8 @@ public final class SyncEngine {
             "deleted": item.deleted,
             "pinned": item.pinned,
             "source": item.source,
+            "type": item.type ?? "text",
+            "pixel": item.pixelSize ?? "",
             "updated_at": Self.iso(item.updatedAt)
         ]
     }

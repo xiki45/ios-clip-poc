@@ -135,6 +135,24 @@ Store2: do {
     check(s2.visibleItems().count == 1, "重新加载持久化生效")
 }
 
+print("== v15 图片 ==")
+let imgData = Data(repeating: 0x89, count: 4096)
+let img = store.upsertImage(imgData, source: "keyboard", pixel: "10×10")
+check(img?.isImage == true, "图片条目 isImage")
+check(img?.kind == "image", "kind 显示为 image")
+check(store.attachmentData(for: img!) == imgData, "附件能读回原始字节")
+let again = store.upsertImage(imgData, source: "keyboard")
+check(again?.id == img?.id, "同一张图去重不新增")
+check(store.visibleItems().count == 2, "图片进库后共 2 条", "\(store.visibleItems().count)")
+
+print("== v15 撤销删除 ==")
+let victim = store.visibleItems().first!
+store.remove(id: victim.id)
+check(!store.visibleItems().contains { $0.id == victim.id }, "删除后不可见")
+store.restore(victim)
+check(store.visibleItems().contains { $0.id == victim.id }, "撤销删除后回来了")
+check(store.visibleItems().first?.id == victim.id, "撤销后仍按时间排在前面")
+
 try? FileManager.default.removeItem(at: dir)
 
 print("\n结果: pass=\(pass) fail=\(fail)")

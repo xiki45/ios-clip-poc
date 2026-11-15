@@ -130,6 +130,16 @@ public final class WebDAVClient {
         try request("PUT", path, body: Data(text.utf8))
     }
 
+    public func putData(_ path: String, _ data: Data) throws -> DAVResponse {
+        try request("PUT", path, body: data)
+    }
+
+    public func getData(_ path: String) throws -> Data? {
+        let r = try request("GET", path)
+        guard r.ok else { return nil }
+        return r.data
+    }
+
     public func getText(_ path: String) throws -> String? {
         let r = try request("GET", path)
         guard r.ok else { return nil }

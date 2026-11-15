@@ -22,6 +22,10 @@ public struct ClipItem: Codable, Equatable {
     public var source: String      // "app" | "keyboard" | "pc"
     public var rev: Int
     public var deleted: Bool
+    // v15：图片/附件支持。老数据没有这两个字段，Optional 让解码自动补 nil。
+    public var type: String? = nil        // nil/"text" = 文本；"image" = 图片
+    public var attachment: String? = nil  // attachments/ 下的文件名
+    public var pixelSize: String? = nil   // "800×600"，仅展示用
 
     public init(text: String, source: String = "unknown") {
         self.id = UUID().uuidString
@@ -35,6 +39,11 @@ public struct ClipItem: Codable, Equatable {
         self.deleted = false
     }
 
+    public static func sha256(_ data: Data) -> String {
+        let digest = SHA256.hash(data: data)
+        return digest.map { String(format: "%02X", $0) }.joined()
+    }
+
     public static func sha256(_ s: String) -> String {
         let digest = SHA256.hash(data: Data(s.utf8))
         return digest.map { String(format: "%02X", $0) }.joined()
@@ -45,7 +54,10 @@ public struct ClipItem: Codable, Equatable {
         return flat.count <= 120 ? flat : String(flat.prefix(120)) + "…"
     }
 
+    public var isImage: Bool { type == "image" }
+
     public var kind: String {
+        if isImage { return "image" }
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if t.hasPrefix("http://") || t.hasPrefix("https://") { return "url" }
         if (t.hasPrefix("{") && t.hasSuffix("}")) || (t.hasPrefix("[") && t.hasSuffix("]")) { return "json" }
@@ -63,12 +75,30 @@ public final class ClipStore {
     public static let fileName = "clip-items.json"
     public static let maxItems = 500
 
+    public static let attachmentsDirName = "attachments"
+
     private let fileURL: URL
+    private let dirURL: URL
     private let queue = DispatchQueue(label: "clip.store")
 
     public init(directory: URL) {
+        self.dirURL = directory
         self.fileURL = directory.appendingPathComponent(ClipStore.fileName)
         load()
+    }
+
+    public var attachmentsURL: URL {
+        dirURL.appendingPathComponent(ClipStore.attachmentsDirName, isDirectory: true)
+    }
+
+    public func attachmentURL(for item: ClipItem) -> URL? {
+        guard let name = item.attachment, !name.isEmpty else { return nil }
+        return attachmentsURL.appendingPathComponent(name)
+    }
+
+    public func attachmentData(for item: ClipItem) -> Data? {
+        guard let url = attachmentURL(for: item) else { return nil }
+        return try? Data(contentsOf: url)
     }
 
     // MARK: 读写
@@ -138,6 +168,57 @@ public final class ClipStore {
         save()
     }
 
+    /// 图片写入：按内容 hash 去重，正文落到 attachments/<hash>.png
+    @discardableResult
+    public func upsertImage(_ data: Data, source: String, pixel: String? = nil) -> ClipItem? {
+        guard !data.isEmpty, data.count <= 20_000_000 else { return nil }
+        let h = ClipItem.sha256(data)
+
+        if let idx = items.firstIndex(where: { $0.hash == h && !$0.deleted }) {
+            items[idx].updatedAt = Date()
+            items[idx].rev += 1
+            items[idx].source = source
+            let moved = items.remove(at: idx)
+            items.insert(moved, at: 0)
+            trim()
+            save()
+            return moved
+        }
+
+        try? FileManager.default.createDirectory(at: attachmentsURL,
+                                                 withIntermediateDirectories: true)
+        let name = "\(h).png"
+        guard (try? data.write(to: attachmentsURL.appendingPathComponent(name))) != nil else {
+            return nil
+        }
+
+        var item = ClipItem(text: "［图片］" + (pixel ?? ""), source: source)
+        item.type = "image"
+        item.attachment = name
+        item.pixelSize = pixel
+        item.hash = h
+        items.insert(item, at: 0)
+        trim()
+        save()
+        return item
+    }
+
+    /// 撤销删除：把 tombstone 复活（rev+1 让其它设备也能看到）
+    public func restore(_ item: ClipItem) {
+        if let idx = items.firstIndex(where: { $0.id == item.id }) {
+            items[idx].deleted = false
+            items[idx].rev += 1
+            items[idx].updatedAt = Date()
+        } else {
+            var it = item
+            it.deleted = false
+            it.rev += 1
+            items.insert(it, at: 0)
+        }
+        reorder()
+        save()
+    }
+
     /// 编辑正文：重算 hash、rev+1，并把条目挪到最前
     @discardableResult
     public func update(id: String, text: String) -> Bool {
@@ -152,6 +233,15 @@ public final class ClipStore {
         items.insert(moved, at: 0)
         save()
         return true
+    }
+
+    /// 同步用：把远端附件落到本地 attachments/
+    @discardableResult
+    public func writeAttachment(named name: String, data: Data) -> Bool {
+        guard !name.isEmpty else { return false }
+        try? FileManager.default.createDirectory(at: attachmentsURL,
+                                                 withIntermediateDirectories: true)
+        return (try? data.write(to: attachmentsURL.appendingPathComponent(name))) != nil
     }
 
     /// 同步用：整表替换（合并结果写回）

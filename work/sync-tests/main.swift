@@ -75,5 +75,18 @@ let aLive = storeA.items.filter { !$0.deleted }.map { $0.id }.sorted()
 let bLive = storeB.items.filter { !$0.deleted }.map { $0.id }.sorted()
 check(aLive == bLive, "两端 id 集合一致", "A=\(aLive.count) B=\(bLive.count)")
 
+print("== 图片同步 ==")
+let imgData = Data(repeating: 0x89, count: 2048)
+_ = storeA.upsertImage(imgData, source: "keyboard", pixel: "12×12")
+_ = try engA.sync(store: storeA)
+_ = try engB.sync(store: storeB)
+check(storeB.items.contains { $0.isImage }, "B 拉到图片条目")
+if let bImg = storeB.items.first(where: { $0.isImage }),
+   let got = storeB.attachmentData(for: bImg) {
+    check(got == imgData, "图片字节完全一致")
+} else {
+    check(false, "图片附件缺失")
+}
+
 print("\n结果: pass=\(pass) fail=\(fail)")
 exit(fail == 0 ? 0 : 1)
