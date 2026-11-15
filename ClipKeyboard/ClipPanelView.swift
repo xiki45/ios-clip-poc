@@ -73,7 +73,7 @@ final class ClipPanelView: UIView {
         }
 
         if !query.isEmpty {
-            list = list.filter { Tokenizer.matches($0.text, query: query) }
+            list = list.filter { TextMatch.matches($0.text, query: query) }
         }
 
         items = Array(list.prefix(80))

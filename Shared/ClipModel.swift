@@ -154,10 +154,8 @@ public final class ClipStore {
     public func search(_ query: String, limit: Int = 200) -> [ClipItem] {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return visibleItems(limit: limit) }
-        let tokens = Tokenizer.tokens(q)
         return visibleItems(limit: Int.max).filter { item in
-            let lower = item.text.lowercased()
-            return tokens.allSatisfy { lower.contains($0) }
+            TextMatch.matches(item.text, query: q)
         }.prefix(limit).map { $0 }
     }
 

@@ -24,13 +24,13 @@ eq(Rewriter.apply("  x  ", steps: [RewriteStep(.trim)]).output, "x", "trim")
 eq(Rewriter.apply("b\na\nb", steps: [RewriteStep(.dedupeLines)]).output, "b\na", "dedupe lines")
 eq(Rewriter.apply("b\na", steps: [RewriteStep(.sortLines)]).output, "a\nb", "sort lines")
 eq(Rewriter.apply("a1b2", steps: [RewriteStep(.regexReplace, ["pattern": "\\d", "replacement": ""])]).output, "ab", "regex replace")
-eq(Rewriter.apply("abc", steps: [RewriteStep(.upper)]).output, "ABC", "upper")
+eq(Rewriter.apply("abc", steps: [RewriteStep(.caseUpper)]).output, "ABC", "case_upper")
 check(Rewriter.apply("x", steps: [RewriteStep(.sha256)]).output.count == 64, "sha256 长度")
 
 let bad = Rewriter.apply("not-base64!!!", steps: [RewriteStep(.base64Decode)])
 check(!bad.ok && bad.error != nil, "非法 base64 应失败")
 
-let chain = Rewriter.apply("aGVsbG8=", steps: [RewriteStep(.base64Decode), RewriteStep(.upper)])
+let chain = Rewriter.apply("aGVsbG8=", steps: [RewriteStep(.base64Decode), RewriteStep(.caseUpper)])
 check(chain.ok && chain.output == "HELLO", "链式执行")
 check(chain.steps.count == 2, "每步有结果")
 
@@ -40,10 +40,40 @@ check(Rewriter.candidates(for: "{\"a\":1}").contains { $0.op == .jsonPretty }, "
 check(Rewriter.candidates(for: "a%20b").contains { $0.op == .urlDecode }, "识别 url 编码")
 check(Rewriter.candidates(for: "随便一段话").isEmpty, "普通文本无候选")
 
-print("== v10 新增算子 ==")
-eq(Rewriter.apply("a   b\t\tc", steps: [RewriteStep(.collapseSpaces)]).output, "a b c", "合并空白")
+print("== v10/v12 算子 ==")
+eq(Rewriter.apply("a   b\t\tc", steps: [RewriteStep(.collapseWhitespace)]).output, "a b c", "合并空白")
 eq(Rewriter.apply("a\n\n\nb\n", steps: [RewriteStep(.stripBlankLines)]).output, "a\nb", "去空行")
-check(Rewriter.apply("支付回调日志", steps: [RewriteStep(.tokenize)]).output.contains("支付"), "分词算子")
+
+print("== v12 对齐参考实现（22 op）==")
+eq(Rewriter.apply("<a href=\"x\">'&'</a>", steps: [RewriteStep(.htmlEscape)]).output,
+   "&lt;a href=&quot;x&quot;&gt;&#39;&amp;&#39;&lt;/a&gt;", "html escape")
+eq(Rewriter.apply("&lt;b&gt; &amp; &#39;x&#39; &#x4E2D;", steps: [RewriteStep(.htmlUnescape)]).output,
+   "<b> & 'x' 中", "html unescape（含数字实体）")
+eq(Rewriter.apply("hello WORLD o'neil", steps: [RewriteStep(.caseTitle)]).output,
+   "Hello World O'neil", "case_title")
+eq(Rewriter.apply("id=42 name=x", steps: [RewriteStep(.regexExtract, ["pattern": "id=(\\d+)"])]).output,
+   "42", "regex_extract 取第一组")
+eq(Rewriter.apply("a1b2c3", steps: [RewriteStep(.regexExtract, ["pattern": "\\d", "flags": "g"])]).output,
+   "1\n2\n3", "regex_extract g 模式")
+check(Rewriter.apply("x", steps: [RewriteStep(.regexExtract, ["pattern": "zzz"])]).ok == false,
+      "regex_extract 无匹配应失败")
+eq(Rewriter.apply("abc", steps: [RewriteStep(.md5)]).output,
+   "900150983cd24fb0d6963f7d28e17f72", "md5")
+eq(Rewriter.apply("0", steps: [RewriteStep(.timestampToIso)]).output,
+   "1970-01-01T00:00:00Z", "timestamp 秒")
+eq(Rewriter.apply("1700000000000", steps: [RewriteStep(.timestampToIso)]).output,
+   "2023-11-14T22:13:20Z", "timestamp 毫秒自动识别")
+check(Rewriter.apply("notnum", steps: [RewriteStep(.timestampToIso)]).ok == false,
+      "timestamp 非数字应失败")
+// 参考实现的 22 个 op 必须一个不差（多出来的是 iOS 侧自有算子，不影响一致性）
+let specOps: Set<String> = ["base64_encode","base64_decode","url_encode","url_decode",
+    "hex_encode","hex_decode","json_pretty","json_minify","html_escape","html_unescape",
+    "trim","collapse_whitespace","case_upper","case_lower","case_title","sort_lines",
+    "dedupe_lines","regex_replace","regex_extract","md5","sha256","timestamp_to_iso"]
+let mine = Set(RewriteOp.allCases.map { $0.rawValue })
+let missing = specOps.subtracting(mine)
+check(missing.isEmpty, "22 个标准算子齐全", "\(missing)")
+check(RewriteOp.allCases.count == 24, "算子总数 24（22 标准 + 2 iOS 自有）", "\(RewriteOp.allCases.count)")
 
 print("== 可用算子过滤（v9 的关键 bug）==")
 // 纯文本：v9 列出的 URL 解码/美化 JSON/按行去重全是 no-op 或必失败
@@ -53,7 +83,7 @@ check(!plainOps.contains(.urlDecode), "纯文本不出现 URL 解码（no-op）"
 check(!plainOps.contains(.jsonPretty), "纯文本不出现美化 JSON（必失败）")
 check(!plainOps.contains(.dedupeLines), "单行不出现按行去重（no-op）")
 check(plainOps.contains(.base64Encode), "纯文本保留 Base64 编码")
-check(plainOps.contains(.upper), "纯文本保留转大写")
+check(plainOps.contains(.caseUpper), "纯文本保留转大写")
 check(plainOps.contains(.sha256), "纯文本保留 SHA-256")
 check(plainOps.count >= 5, "纯文本至少 5 个可用算子", "\(plainOps)")
 
@@ -72,37 +102,12 @@ for text in [plain, "{\"a\":1}", "b\na\nb", "aGVsbG8=", "a%20b", "  空格  "] {
     check(allEffective, "列出的算子都有效果: \(text)", "\(Rewriter.options(for: text).map { $0.op })")
 }
 
-print("== Tokenizer ==")
-let t1 = Tokenizer.tokens("支付回调日志")
-check(t1 == ["支付", "回调", "日志"], "中文 2-gram 不重叠", "\(t1)")
-let t2 = Tokenizer.tokens("getUserName 你好")
-check(t2.contains("get") && t2.contains("user") && t2.contains("name"), "驼峰拆分", "\(t2)")
-check(Tokenizer.matches("支付接口回调失败", query: "支付 回调"), "多 token AND")
-check(!Tokenizer.matches("支付接口失败", query: "支付 回调"), "缺 token 不匹配")
-
-print("== v11 分词：块感知 ==")
-let seg = Tokenizer.tokens("文本 https://example.com/a?b=1 支付回调")
-check(seg.contains("https://example.com/a?b=1"), "URL 作为整体一个 token", "\(seg)")
-check(seg.contains("文本") && seg.contains("支付") && seg.contains("回调"), "URL 前后文本正常切", "\(seg)")
-check(!seg.contains("http") && !seg.contains("com"), "URL 不再被拆碎", "\(seg)")
-
-let seg2 = Tokenizer.tokens("联系 a@b.com 或 2026-11-13 或 Infoway 版本 v1.2")
-check(seg2.contains("a@b.com"), "邮箱整体保留", "\(seg2)")
-check(seg2.contains("2026-11-13"), "日期整体保留", "\(seg2)")
-check(seg2.contains("infoway"), "英文单词整词小写", "\(seg2)")
-check(!seg2.contains("https"), "无链接时不产生伪 URL", "\(seg2)")
-
-let seg3 = Tokenizer.tokens("支付回调日")
-check(seg3 == ["支付", "回调", "日"], "奇数长度尾字保留", "\(seg3)")
-
-let seg4 = Tokenizer.tokens("见 https://infoway.com/x.")
-check(seg4.contains("https://infoway.com/x"), "URL 尾部句点剥离", "\(seg4)")
-
-let seg5 = Tokenizer.segments("https://www.zhihu.com/question/123?a=1#c")
-check(seg5 == ["https://www.zhihu.com/question/123?a=1#c"], "带参数与锚点的完整 URL", "\(seg5)")
-
-check(Tokenizer.matches("见 https://example.com/x", query: "example.com"), "域名可被搜索到")
-check(Tokenizer.matches("getUserName 接口", query: "user"), "驼峰内单词可被搜索到")
+print("== TextMatch（分词已下线）==")
+check(TextMatch.matches("支付接口回调失败", query: "支付 回调"), "多词 AND")
+check(!TextMatch.matches("支付接口失败", query: "支付 回调"), "缺词不匹配")
+check(TextMatch.matches("见 https://Example.com/x", query: "example.com"), "大小写不敏感")
+check(TextMatch.matches("任意内容", query: "   "), "空查询放行")
+check(TextMatch.isCJK("支") && !TextMatch.isCJK("a"), "CJK 判定")
 
 print("== ClipStore ==")
 let dir = FileManager.default.temporaryDirectory.appendingPathComponent("cliptest-\(UUID().uuidString)")

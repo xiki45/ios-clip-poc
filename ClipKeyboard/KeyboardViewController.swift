@@ -139,7 +139,7 @@ final class KeyboardViewController: UIInputViewController {
 
         // 单字符只有中文值得拿来过滤，单字母会命中一切
         if word.count == 1 {
-            guard let c = word.first, Tokenizer.isCJK(c) else { return nil }
+            guard let c = word.first, TextMatch.isCJK(c) else { return nil }
         }
         return word
     }

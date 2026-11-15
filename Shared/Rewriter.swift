@@ -4,10 +4,13 @@
 //
 //  与 Python 参考实现（tasks/clip-sync-prototype）保持语义一致，
 //  可用 spec-conformance.json 的 41 条向量做回归。
-//  v10 追加 collapseSpaces / stripBlankLines / tokenize 三个文本算子。
+//  v12 对齐 Python 参考实现（22 个 op）：补 html_escape/unescape、case_title、
+//      regex_extract、md5、timestamp_to_iso；改名 case_upper/case_lower/
+//      collapse_whitespace；删除 tokenize（分词交给主键盘）。
 //
 
 import Foundation
+import CryptoKit
 
 // MARK: - 算子
 
@@ -20,18 +23,22 @@ public enum RewriteOp: String, Codable, CaseIterable {
     case hexDecode = "hex_decode"
     case jsonPretty = "json_pretty"
     case jsonMinify = "json_minify"
+    case htmlEscape = "html_escape"
+    case htmlUnescape = "html_unescape"
     case trim
-    case upper
-    case lower
+    case collapseWhitespace = "collapse_whitespace"
+    case caseUpper = "case_upper"
+    case caseLower = "case_lower"
+    case caseTitle = "case_title"
     case sortLines = "sort_lines"
     case dedupeLines = "dedupe_lines"
     case numberLines = "number_lines"
     case regexReplace = "regex_replace"
-    case sha256
-    // v10
-    case collapseSpaces = "collapse_spaces"
+    case regexExtract = "regex_extract"
     case stripBlankLines = "strip_blank_lines"
-    case tokenize
+    case md5
+    case sha256
+    case timestampToIso = "timestamp_to_iso"
 
     public var displayName: String {
         switch self {
@@ -43,17 +50,22 @@ public enum RewriteOp: String, Codable, CaseIterable {
         case .hexDecode: return "Hex 解码"
         case .jsonPretty: return "美化 JSON"
         case .jsonMinify: return "压缩 JSON"
+        case .htmlEscape: return "HTML 转义"
+        case .htmlUnescape: return "HTML 反转义"
         case .trim: return "去首尾空白"
-        case .upper: return "转大写"
-        case .lower: return "转小写"
+        case .collapseWhitespace: return "合并空白"
+        case .caseUpper: return "转大写"
+        case .caseLower: return "转小写"
+        case .caseTitle: return "首字母大写"
         case .sortLines: return "按行排序"
         case .dedupeLines: return "按行去重"
         case .numberLines: return "加行号"
         case .regexReplace: return "正则替换"
-        case .sha256: return "SHA-256"
-        case .collapseSpaces: return "合并空白"
+        case .regexExtract: return "正则提取"
         case .stripBlankLines: return "去空行"
-        case .tokenize: return "分词"
+        case .md5: return "MD5"
+        case .sha256: return "SHA-256"
+        case .timestampToIso: return "时间戳→ISO"
         }
     }
 
@@ -61,13 +73,15 @@ public enum RewriteOp: String, Codable, CaseIterable {
     public var section: String {
         switch self {
         case .base64Encode, .base64Decode, .urlEncode, .urlDecode,
-             .hexEncode, .hexDecode, .jsonPretty, .jsonMinify:
+             .hexEncode, .hexDecode, .jsonPretty, .jsonMinify,
+             .htmlEscape, .htmlUnescape:
             return "编码"
-        case .trim, .upper, .lower, .sortLines, .dedupeLines,
-             .numberLines, .collapseSpaces, .stripBlankLines, .tokenize, .regexReplace:
+        case .trim, .caseUpper, .caseLower, .caseTitle, .sortLines, .dedupeLines,
+             .numberLines, .collapseWhitespace, .stripBlankLines, .regexReplace,
+             .regexExtract:
             return "文本"
-        case .sha256:
-            return "哈希"
+        case .md5, .sha256, .timestampToIso:
+            return "数据"
         }
     }
 
@@ -77,12 +91,13 @@ public enum RewriteOp: String, Codable, CaseIterable {
         case .urlEncode, .urlDecode: return "link"
         case .hexEncode, .hexDecode: return "number"
         case .jsonPretty, .jsonMinify: return "curlybraces"
-        case .trim, .collapseSpaces, .stripBlankLines: return "scissors"
-        case .upper, .lower: return "textformat.size"
+        case .htmlEscape, .htmlUnescape: return "chevron.left.slash.chevron.right"
+        case .trim, .collapseWhitespace, .stripBlankLines: return "scissors"
+        case .caseUpper, .caseLower, .caseTitle: return "textformat.size"
         case .sortLines, .dedupeLines, .numberLines: return "list.number"
-        case .regexReplace: return "asterisk"
-        case .sha256: return "lock"
-        case .tokenize: return "text.word.spacing"
+        case .regexReplace, .regexExtract: return "asterisk"
+        case .md5, .sha256: return "lock"
+        case .timestampToIso: return "clock"
         }
     }
 }
@@ -226,10 +241,10 @@ public enum Rewriter {
         case .trim:
             return input.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        case .upper:
+        case .caseUpper:
             return input.uppercased()
 
-        case .lower:
+        case .caseLower:
             return input.lowercased()
 
         case .sortLines:
@@ -264,7 +279,7 @@ public enum Rewriter {
         case .sha256:
             return ClipItem.sha256(input)
 
-        case .collapseSpaces:
+        case .collapseWhitespace:
             // 连续空白压成一个空格，换行保留（不破坏行结构）
             let lines = input.components(separatedBy: "\n").map { line -> String in
                 var out = ""
@@ -287,10 +302,127 @@ public enum Rewriter {
                 .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
                 .joined(separator: "\n")
 
-        case .tokenize:
-            // 复用检索用分词器：中文 2-gram + 英文小写，空格连接，可直接当标签用
-            return Tokenizer.tokens(input).joined(separator: " ")
+        case .htmlEscape:
+            return input
+                .replacingOccurrences(of: "&", with: "&amp;")
+                .replacingOccurrences(of: "<", with: "&lt;")
+                .replacingOccurrences(of: ">", with: "&gt;")
+                .replacingOccurrences(of: "\"", with: "&quot;")
+                .replacingOccurrences(of: "'", with: "&#39;")
+
+        case .htmlUnescape:
+            var out = input
+                .replacingOccurrences(of: "&lt;", with: "<")
+                .replacingOccurrences(of: "&gt;", with: ">")
+                .replacingOccurrences(of: "&quot;", with: "\"")
+                .replacingOccurrences(of: "&#39;", with: "'")
+                .replacingOccurrences(of: "&apos;", with: "'")
+                .replacingOccurrences(of: "&nbsp;", with: "\u{00A0}")
+                .replacingOccurrences(of: "&amp;", with: "&")   // 放最后，避免二次解码
+            // 数字实体：&#xHH; / &#DDD;
+            out = Rewriter.replaceNumericEntities(out)
+            return out
+
+        case .caseTitle:
+            // 与参考实现一致：只处理 [A-Za-z0-9'’]+ 的词，首字母大写其余小写
+            return Rewriter.titleCase(input)
+
+        case .regexExtract:
+            guard let pattern = p["pattern"], !pattern.isEmpty else { throw fail("缺少 pattern 参数") }
+            var options: NSRegularExpression.Options = []
+            if p["flags"]?.contains("i") == true { options.insert(.caseInsensitive) }
+            guard let re = try? NSRegularExpression(pattern: pattern, options: options) else {
+                throw fail("正则不合法")
+            }
+            let range = NSRange(input.startIndex..., in: input)
+            let matches = re.matches(in: input, options: [], range: range)
+            guard !matches.isEmpty else { throw fail("没有匹配") }
+            if p["flags"]?.contains("g") == true {
+                return matches.compactMap { m in
+                    Range(m.range, in: input).map { String(input[$0]) }
+                }.joined(separator: "\n")
+            }
+            let m = matches[0]
+            if m.numberOfRanges > 1, let r = Range(m.range(at: 1), in: input) {
+                return String(input[r])
+            }
+            return Range(m.range, in: input).map { String(input[$0]) } ?? ""
+
+        case .md5:
+            return Rewriter.md5Hex(input)
+
+        case .timestampToIso:
+            let raw = input.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !raw.isEmpty,
+                  raw.rangeOfCharacter(from: CharacterSet(charactersIn: "0123456789.-").inverted) == nil,
+                  let num = Double(raw) else {
+                throw fail("不是数字时间戳")
+            }
+            let seconds = abs(num) >= 1e11 ? num / 1000.0 : num
+            let date = Date(timeIntervalSince1970: seconds)
+            let f = DateFormatter()
+            f.locale = Locale(identifier: "en_US_POSIX")
+            f.timeZone = TimeZone(identifier: "UTC")
+            f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss'Z'"
+            return f.string(from: date)
         }
+    }
+
+    // MARK: - 辅助
+
+    /// 首字母大写、其余小写，只作用于 [A-Za-z0-9'’]+ 的词（对齐参考实现）
+    static func titleCase(_ input: String) -> String {
+        var out = ""
+        var word = ""
+        func flush() {
+            guard !word.isEmpty else { return }
+            let first = word.first!
+            if first.isLetter {
+                out += String(first).uppercased() + word.dropFirst().lowercased()
+            } else {
+                out += word
+            }
+            word = ""
+        }
+        for ch in input {
+            let isWordChar = ch.isASCII && (ch.isLetter || ch.isNumber || ch == "'" || ch == "\u{2019}")
+            if isWordChar { word.append(ch) } else { flush(); out.append(ch) }
+        }
+        flush()
+        return out
+    }
+
+    /// 只解数字实体 &#xHH; / &#DDD;，命名实体由调用方处理
+    static func replaceNumericEntities(_ input: String) -> String {
+        guard input.contains("&#") else { return input }
+        var out = ""
+        var i = input.startIndex
+        while i < input.endIndex {
+            guard input[i] == "&",
+                  let semi = input[i...].firstIndex(of: ";"),
+                  input.distance(from: i, to: semi) <= 10 else {
+                out.append(input[i]); i = input.index(after: i); continue
+            }
+            let body = String(input[input.index(after: i)..<semi])
+            var scalar: UInt32?
+            if body.hasPrefix("#x") || body.hasPrefix("#X") {
+                scalar = UInt32(body.dropFirst(2), radix: 16)
+            } else if body.hasPrefix("#") {
+                scalar = UInt32(body.dropFirst(1), radix: 10)
+            }
+            if let v = scalar, let u = Unicode.Scalar(v) {
+                out.unicodeScalars.append(u)
+                i = input.index(after: semi)
+            } else {
+                out.append(input[i]); i = input.index(after: i)
+            }
+        }
+        return out
+    }
+
+    static func md5Hex(_ input: String) -> String {
+        let digest = Insecure.MD5.hash(data: Data(input.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
     }
 
     // MARK: - 自动识别（零思考层）
@@ -382,18 +514,16 @@ public enum Rewriter {
         if trimmed != text, let s = changedOutput(of: text, step: RewriteStep(.trim)) {
             out.append(Option(step: RewriteStep(.trim), title: "去首尾空白", detail: preview(s)))
         }
-        if hasLetter, let s = changedOutput(of: text, step: RewriteStep(.upper)) {
-            out.append(Option(step: RewriteStep(.upper), title: "转大写", detail: preview(s)))
+        if hasLetter, let s = changedOutput(of: text, step: RewriteStep(.caseUpper)) {
+            out.append(Option(step: RewriteStep(.caseUpper), title: "转大写", detail: preview(s)))
         }
-        if hasLetter, let s = changedOutput(of: text, step: RewriteStep(.lower)) {
-            out.append(Option(step: RewriteStep(.lower), title: "转小写", detail: preview(s)))
+        if hasLetter, let s = changedOutput(of: text, step: RewriteStep(.caseLower)) {
+            out.append(Option(step: RewriteStep(.caseLower), title: "转小写", detail: preview(s)))
         }
-        if let s = changedOutput(of: text, step: RewriteStep(.collapseSpaces)) {
-            out.append(Option(step: RewriteStep(.collapseSpaces), title: "合并空白", detail: preview(s)))
+        if let s = changedOutput(of: text, step: RewriteStep(.collapseWhitespace)) {
+            out.append(Option(step: RewriteStep(.collapseWhitespace), title: "合并空白", detail: preview(s)))
         }
-        if let s = changedOutput(of: text, step: RewriteStep(.tokenize)) {
-            out.append(Option(step: RewriteStep(.tokenize), title: "分词", detail: preview(s)))
-        }
+
 
         // 去重（按 op 收敛）
         var uniq: [Option] = []
