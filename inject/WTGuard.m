@@ -47,7 +47,16 @@ static atomic_bool g_isApp   = false;
 // 探到能真正 fopen 的那个才用；同时在进程内留一份环形缓冲，
 // 这样即使文件一个字节都没落地，胶囊里的 init / 出网 / 最近拦截 也照样能看。
 
-static const int kWTGVersion = 14;
+static const int kWTGVersion = 15;
+
+// v15：引导摘要单独用固定变量保存，不进环形缓冲 —— 之前 init 段被
+// "胶囊控制台已装" 这类重复行挤掉，导致永远看不到载入/DNS 结果。
+static NSString *g_bootLoad = nil;      // 载入行（含 logpath/tag/errno/候选数）
+static NSString *g_bootDns  = nil;      // DNS 槽位结论
+static int g_dnsPlan = 0, g_dnsPatched = 0;
+static atomic_int g_gaiCalls = 0, g_gaiBlocked = 0;
+static atomic_int g_connCalls = 0, g_connBlocked = 0;
+static atomic_int g_hostNames = 0, g_hostBlocked = 0;
 
 static NSString *WTGShort(NSString *l);
 
@@ -322,7 +331,7 @@ static NSString *WTGSummary(void) {
         return [b compare:a];
     }];
     for (NSString *k in keys) {
-        [m appendFormat:@"%@ x%@", k, WTGIDs()[k]];
+        [m appendFormat:@"%@ x%@ · ", k, WTGIDs()[k]];
     }
     return m;
 }
@@ -526,6 +535,7 @@ static void wtg_repatch(void);
 static int wtg_gai(const char *node, const char *service,
                    const struct addrinfo *hints, struct addrinfo **res) {
     if (!WTGOrigGAI) return EAI_FAIL;
+    atomic_fetch_add(&g_gaiCalls, 1);
     if (node && WTGOn()) {
         @autoreleasepool {
             NSString *host = [NSString stringWithUTF8String:node];
@@ -536,6 +546,7 @@ static int wtg_gai(const char *node, const char *service,
                 }
                 if (fresh) WTGLog(@"[obs] DNS 解析 %@", host);
                 if (WTGHostBlocked(host)) {
+                    atomic_fetch_add(&g_gaiBlocked, 1);
                     WTGHit([NSString stringWithFormat:@"DNS 拦截 %@", host]);
                     return EAI_NONAME;
                 }
@@ -549,6 +560,7 @@ static int wtg_gai(const char *node, const char *service,
 
 static int wtg_connect(int fd, const struct sockaddr *addr, socklen_t len) {
     if (!WTGOrigConnect) return -1;
+    atomic_fetch_add(&g_connCalls, 1);
     if (addr && WTGOn()) {
         @autoreleasepool {
             char buf[96] = {0};
@@ -594,6 +606,7 @@ static NSMapTable *WTGHostMap(void) {
 }
 
 static CFHostRef wtg_host_create(CFAllocatorRef alloc, CFStringRef name) {
+    if (name) atomic_fetch_add(&g_hostNames, 1);
     CFHostRef host = WTGOrigHostCreate ? WTGOrigHostCreate(alloc, name) : NULL;
     if (host && name) {
         @synchronized (WTGHostMap()) { [WTGHostMap() setObject:(__bridge id)name forKey:(__bridge id)host]; }
@@ -680,7 +693,7 @@ struct wtg_starts_in_segment {
 
 static void wtg_patch_host_image(void) {
     const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(0);
-    if (!mh || mh->magic != MH_MAGIC_64) { WTGLog(@"[init] DNS：取不到主镜像头"); return; }
+    if (!mh || mh->magic != MH_MAGIC_64) { g_bootDns = @"DNS:取不到镜像头"; WTGLog(@"[init] DNS：取不到主镜像头"); return; }
     uintptr_t base = (uintptr_t)mh;
 
     uint64_t textVm = 0, leVm = 0, leOff = 0;
@@ -698,14 +711,15 @@ static void wtg_patch_host_image(void) {
         }
         p += lc->cmdsize;
     }
-    if (!cf || !hasLe) { WTGLog(@"[init] DNS：镜像缺 chained fixups / __LINKEDIT，跳过"); return; }
+    if (!cf || !hasLe) { g_bootDns = @"DNS:缺chained fixups"; WTGLog(@"[init] DNS：镜像缺 chained fixups / __LINKEDIT，跳过"); return; }
 
     wtg_collect_sections(mh, base, textVm);
-    if (g_secCount == 0) { WTGLog(@"[init] DNS：没找到 __got/__la_symbol_ptr"); return; }
+    if (g_secCount == 0) { g_bootDns = @"DNS:没找到__got"; WTGLog(@"[init] DNS：没找到 __got/__la_symbol_ptr"); return; }
 
     const uint8_t *fix = (const uint8_t *)(base + (leVm - textVm) + (cf->dataoff - leOff));
     const struct wtg_fixups_header *h = (const struct wtg_fixups_header *)fix;
     if (h->imports_format != 1 && h->imports_format != 3) {
+        g_bootDns = [NSString stringWithFormat:@"DNS:ifmt%u不支持", h->imports_format];
         WTGLog(@"[init] DNS：imports_format=%u 不支持", h->imports_format);
         return;
     }
@@ -739,6 +753,7 @@ static void wtg_patch_host_image(void) {
     if (plan.count == 0) {
         uint8_t probe[8] = {0};
         if (imports) memcpy(probe, imports, MIN((size_t)8, (size_t)16));
+        g_bootDns = [NSString stringWithFormat:@"DNS:plan0 sec%d cnt%u", g_secCount, h->imports_count];
         WTGLog(@"[init] 槽位解析失败 base=%p textVm=%llx leVm=%llx leOff=%llx dataoff=%u "
                @"ver=%u ifmt=%u cnt=%u symoff=%u secCount=%d b=%02x%02x%02x%02x",
                (void *)(uintptr_t)base, textVm, leVm, leOff, cf->dataoff,
@@ -798,6 +813,10 @@ static void wtg_patch_host_image(void) {
             }
         }
     }
+    g_dnsPlan = (int)plan.count;  g_dnsPatched = patched;
+    g_bootDns = [NSString stringWithFormat:@"DNS:%d/%lu槽 %@",
+                 patched, (unsigned long)plan.count,
+                 [names componentsJoinedByString:@","]];
     WTGLog(@"[init] 导入槽 patched=%d/%lu create=%lu resolve=%lu gai=%lu connect=%lu names=%@",
            patched, (unsigned long)plan.count,
            (unsigned long)g_slotCreate, (unsigned long)g_slotResolve,
@@ -830,23 +849,22 @@ static const void *kLongKey = &kLongKey;
 
 - (void)insertTail {
     // 环形缓冲优先：文件哪怕一个字节都没落地，这三段也一定有内容
-    NSString *initSelf = WTGRingMatching(@"[init]", 3);
-    NSString *initFkb  = WTGLinesMatching(@"[kb] [init]", 2);
-    NSString *initFapp = WTGLinesMatching(@"[app] [init]", 2);
-    NSMutableArray *ip = [NSMutableArray array];
-    if (initSelf.length) [ip addObject:initSelf];
-    if (initFapp.length && ![initSelf containsString:@"主 App"]) [ip addObject:[@"Fapp:" stringByAppendingString:initFapp]];
-    if (initFkb.length && ![initSelf containsString:@"键盘扩展"])  [ip addObject:[@"Fkb:" stringByAppendingString:initFkb]];
-    NSString *init = [ip componentsJoinedByString:@" ∥ "];
+    NSString *init = [NSString stringWithFormat:@"%@ ∥ %@",
+                      g_bootLoad ?: @"载入行缺失",
+                      g_bootDns  ?: @"DNS 未执行"];
 
     NSString *obs = WTGRingMatching(@"[obs]", 6);
     if (!obs.length) obs = WTGLinesMatching(@"[obs]", 6);
     NSString *blocks = WTGHitRingMatching(3);
     if (!blocks.length) blocks = WTGLinesMatching(@"拦截 ", 3);
 
-    NSString *meta = [NSString stringWithFormat:@"log=%lluKB/%@ e%d %d候选 环%lu",
-                      g_logBytes / 1024, WTGLogTag(), g_logErr, g_logCands,
-                      (unsigned long)(WTGRingLog().count + WTGRingHit().count)];
+    NSString *meta = [NSString stringWithFormat:@"log=%lluKB/%@ e%d 环%lu dns%db gai%d/%d conn%d/%d host%d",
+                      g_logBytes / 1024, WTGLogTag(), g_logErr,
+                      (unsigned long)(WTGRingLog().count + WTGRingHit().count),
+                      g_dnsPatched,
+                      atomic_load(&g_gaiCalls), atomic_load(&g_gaiBlocked),
+                      atomic_load(&g_connCalls), atomic_load(&g_connBlocked),
+                      atomic_load(&g_hostNames)];
     NSString *tail = [NSString stringWithFormat:@"%@ ｜ %@ ｜ init: %@ ｜ 出网: %@ ｜ 最近拦截: %@",
                       WTGSummary(), meta, init.length ? init : @"-",
                       obs.length ? obs : @"(本进程暂无 DNS/连接记录)",
@@ -915,7 +933,8 @@ static void WTGLayoutChip(UIViewController *vc) {
             objc_setAssociatedObject(container, kTapKey, h, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(container, kLongKey, h, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
-        WTGLog(@"[init] 胶囊控制台已装");
+        static BOOL once = NO;
+        if (!once) { once = YES; WTGLog(@"[init] 胶囊控制台已装"); }
     }
     if (chip.superview != container) [container addSubview:chip];
 
@@ -1094,6 +1113,8 @@ __attribute__((constructor)) static void wtg_init(void) {
         WTGLog(@"[init] v%d %@ 载入 stage=%d bundle=%@ logpath=%@ tag=%@ errno=%d 候选=%d",
                kWTGVersion, inApp ? @"app" : @"kb", WTGStage(), bundle.lastPathComponent,
                g_logPath ?: @"(nil)", WTGLogTag(), g_logErr, g_logCands);
+        g_bootLoad = [NSString stringWithFormat:@"v%d %@ S%d %@ e%d",
+                      kWTGVersion, inApp ? @"app" : @"kb", WTGStage(), WTGLogTag(), g_logErr];
 
         @try {
             if (!inApp) {
@@ -1106,6 +1127,7 @@ __attribute__((constructor)) static void wtg_init(void) {
                 WTGHook(vc, @selector(viewDidLayoutSubviews), (IMP)g_viewDidLayout, (IMP *)&o_viewDidLayout);
                 @try { wtg_patch_host_image(); }
                 @catch (NSException *e) { WTGLog(@"DNS 层异常 %@", e); }
+                g_bootLoad = [g_bootLoad stringByAppendingString:@" 全开"];
                 WTGLog(@"[init] 键盘扩展：S4 全量拦截已启用");
             } else {
                 int s = WTGStage();
