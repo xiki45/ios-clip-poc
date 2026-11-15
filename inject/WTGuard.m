@@ -47,7 +47,7 @@ static atomic_bool g_isApp   = false;
 // 探到能真正 fopen 的那个才用；同时在进程内留一份环形缓冲，
 // 这样即使文件一个字节都没落地，胶囊里的 init / 出网 / 最近拦截 也照样能看。
 
-static const int kWTGVersion = 13;
+static const int kWTGVersion = 14;
 
 static NSString *WTGShort(NSString *l);
 
@@ -1072,8 +1072,19 @@ static void WTGInstallHooks(void) {
     WTGLog(@"S1 hook 完成");
 }
 
+// 外部注入器（TrollFools 等）可能给同一个进程挂两份不同路径的守卫，
+// 那会导致 hook 装两遍、计数翻倍。用导出符号判断「是否已有一份在跑」。
+int wtg_guard_loaded = 1;
+
 __attribute__((constructor)) static void wtg_init(void) {
     @autoreleasepool {
+        void *other = dlsym(RTLD_DEFAULT, "wtg_guard_loaded");
+        if (other && other != (void *)&wtg_guard_loaded) {
+            atomic_store(&g_isApp, [[[NSBundle mainBundle] bundlePath] hasSuffix:@".app"]);
+            WTGLog(@"[init] 检测到本进程已有一份守卫在跑，本镜像直接让位（避免双份 hook）");
+            return;
+        }
+
         NSString *bundle = [[NSBundle mainBundle] bundlePath];
         BOOL inApp = [bundle hasSuffix:@".app"];
         atomic_store(&g_isApp, inApp);
