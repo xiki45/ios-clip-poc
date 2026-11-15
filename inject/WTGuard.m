@@ -47,7 +47,7 @@ static atomic_bool g_isApp   = false;
 // 探到能真正 fopen 的那个才用；同时在进程内留一份环形缓冲，
 // 这样即使文件一个字节都没落地，胶囊里的 init / 出网 / 最近拦截 也照样能看。
 
-static const int kWTGVersion = 15;
+static const int kWTGVersion = 16;
 
 // v15：引导摘要单独用固定变量保存，不进环形缓冲 —— 之前 init 段被
 // "胶囊控制台已装" 这类重复行挤掉，导致永远看不到载入/DNS 结果。
@@ -324,8 +324,7 @@ static void WTGHit(NSString *what) {
 
 static NSString *WTGSummary(void) {
     NSMutableString *m = [NSMutableString string];
-    [m appendFormat:@"——[%@]v%d 共 %lu 次 / %lu 种 reportID ——",
-     atomic_load(&g_isApp) ? @"app" : @"kb", kWTGVersion, (unsigned long)WTGCount,
+    [m appendFormat:@"共 %lu 次 / %lu 种 reportID: ", (unsigned long)WTGCount,
      (unsigned long)WTGIDs().count];
     NSArray *keys = [WTGIDs() keysSortedByValueUsingComparator:^NSComparisonResult(NSNumber *a, NSNumber *b) {
         return [b compare:a];
@@ -333,6 +332,7 @@ static NSString *WTGSummary(void) {
     for (NSString *k in keys) {
         [m appendFormat:@"%@ x%@ · ", k, WTGIDs()[k]];
     }
+    if ([m hasSuffix:@" · "]) [m deleteCharactersInRange:NSMakeRange(m.length - 3, 3)];
     return m;
 }
 
@@ -848,28 +848,36 @@ static const void *kLongKey = &kLongKey;
 }
 
 - (void)insertTail {
-    // 环形缓冲优先：文件哪怕一个字节都没落地，这三段也一定有内容
-    NSString *init = [NSString stringWithFormat:@"%@ ∥ %@",
+    // 顺序即优先级：新的读数放最前，超长时从尾部丢（旧版是从头部截，正好把 init 切掉）
+    NSString *boot = [NSString stringWithFormat:@"%@ ∥ %@",
                       g_bootLoad ?: @"载入行缺失",
                       g_bootDns  ?: @"DNS 未执行"];
-
-    NSString *obs = WTGRingMatching(@"[obs]", 6);
-    if (!obs.length) obs = WTGLinesMatching(@"[obs]", 6);
-    NSString *blocks = WTGHitRingMatching(3);
-    if (!blocks.length) blocks = WTGLinesMatching(@"拦截 ", 3);
-
-    NSString *meta = [NSString stringWithFormat:@"log=%lluKB/%@ e%d 环%lu dns%db gai%d/%d conn%d/%d host%d",
-                      g_logBytes / 1024, WTGLogTag(), g_logErr,
-                      (unsigned long)(WTGRingLog().count + WTGRingHit().count),
-                      g_dnsPatched,
+    NSString *meta = [NSString stringWithFormat:
+                      @"log=%lluKB/%@ e%d dns%db gai%d/%d conn%d/%d host%d 环%lu",
+                      g_logBytes / 1024, WTGLogTag(), g_logErr, g_dnsPatched,
                       atomic_load(&g_gaiCalls), atomic_load(&g_gaiBlocked),
                       atomic_load(&g_connCalls), atomic_load(&g_connBlocked),
-                      atomic_load(&g_hostNames)];
-    NSString *tail = [NSString stringWithFormat:@"%@ ｜ %@ ｜ init: %@ ｜ 出网: %@ ｜ 最近拦截: %@",
-                      WTGSummary(), meta, init.length ? init : @"-",
-                      obs.length ? obs : @"(本进程暂无 DNS/连接记录)",
-                      blocks.length ? blocks : @"-"];
-    if (tail.length > 1900) tail = [tail substringFromIndex:tail.length - 1900];
+                      atomic_load(&g_hostNames),
+                      (unsigned long)(WTGRingLog().count + WTGRingHit().count)];
+    NSString *obs = WTGRingMatching(@"[obs]", 4);
+    if (!obs.length) obs = WTGLinesMatching(@"[obs]", 4);
+    NSString *blocks = WTGHitRingMatching(2);
+    if (!blocks.length) blocks = WTGLinesMatching(@"拦截 ", 2);
+
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    [parts addObject:[NSString stringWithFormat:@"——[%@]v%d init: %@",
+                      atomic_load(&g_isApp) ? @"app" : @"kb", kWTGVersion, boot]];
+    [parts addObject:meta];
+    [parts addObject:WTGSummary()];
+    [parts addObject:[NSString stringWithFormat:@"出网: %@", obs.length ? obs : @"(无，流量都在 ObjC 层被挡)"]];
+    [parts addObject:[NSString stringWithFormat:@"最近拦截: %@", blocks.length ? blocks : @"-"]];
+
+    NSMutableString *tail = [NSMutableString string];
+    for (NSString *p in parts) {
+        if (tail.length && tail.length + p.length + 3 > 1900) break;
+        if (tail.length) [tail appendString:@" ｜ "];
+        [tail appendString:p];
+    }
     UIViewController *vc = self.host;
     if (![vc isKindOfClass:[UIInputViewController class]]) return;
     id proxy = [(UIInputViewController *)vc textDocumentProxy];
