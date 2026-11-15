@@ -152,9 +152,7 @@ final class ClipPanelView: UIView {
         emptyLabel.translatesAutoresizingMaskIntoConstraints = false
         addSubview(emptyLabel)
 
-        thumbWidth = thumbView.widthAnchor.constraint(equalToConstant: 0)
         NSLayoutConstraint.activate([
-            thumbWidth,
             filterBar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
             filterBar.trailingAnchor.constraint(equalTo: close.leadingAnchor, constant: -4),
             filterBar.topAnchor.constraint(equalTo: topAnchor, constant: 4),
@@ -386,7 +384,9 @@ final class ClipCell: UITableViewCell {
         contentView.addSubview(pinIcon)
         contentView.addSubview(rewriteButton)
 
+        thumbWidth = thumbView.widthAnchor.constraint(equalToConstant: 0)
         NSLayoutConstraint.activate([
+            thumbWidth,
             rewriteButton.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -6),
             rewriteButton.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
             rewriteButton.widthAnchor.constraint(equalToConstant: 40),
