@@ -2,7 +2,7 @@
 
 > 仓库：<https://github.com/xiki45/ios-clip-poc>（`main`）
 > 本地：`2026-11-05T19:18-mobile-ime-research/tasks/ios-poc-appgroup/output/`
-> 现状：v15 · 53 个提交 · Swift 2732 行（不含注释约 1900 行）
+> 现状：v15 · 55 个提交 · Swift 3042 行（不含注释约 2100 行）
 
 ---
 
@@ -16,14 +16,14 @@ PocApp/        宿主 App（管理界面 + 同步）
 
 | 目录 | 文件 | 行数 | 职责 | 核心？ |
 |---|---|---|---|---|
-| Shared | `ClipModel.swift` | 246 | `ClipItem` 数据模型 + `ClipStore` 本地库 | ★★★ |
+| Shared | `ClipModel.swift` | 336 | `ClipItem` 数据模型 + `ClipStore` 本地库 | ★★★ |
 | Shared | `Rewriter.swift` | 568 | 22 个重写算子 + 自动识别候选 | ★★★ |
 | Shared | `TextMatch.swift` | 36 | 检索匹配（多词 AND） | ★★ |
 | Shared | `GroupStore.swift` | 147 | App Group 容器定位 + JSONL 日志 + 心跳 | ★★ |
 | ClipKeyboard | `KeyboardViewController.swift` | 247 | 采集循环 / 插入 / 重写 / 轮询 | ★★★ |
-| ClipKeyboard | `ClipPanelView.swift` | 410 | 面板 UI（chip、列表、重写菜单） | ★★★ |
+| ClipKeyboard | `ClipPanelView.swift` | 440 | 面板 UI（chip、列表、重写菜单） | ★★★ |
 | PocApp | `AppModel.swift` | 236 | 库状态 + 同步动作 | ★★★ |
-| PocApp | `ContentView.swift` | 359 | 列表 / 编辑 / 设置 | ★★ |
+| PocApp | `ContentView.swift` | 458 | 列表 / 编辑 / 设置 | ★★ |
 | PocApp | `SyncEngine.swift` | 266 | 合并 / 冲突 / 推送 | ★★★ |
 | PocApp | `WebDAVClient.swift` | 138 | GET/PUT/MKCOL + Basic Auth + ETag | ★★ |
 | PocApp | `SyncConfig.swift` | 58 | 同步配置存取 | ★ |
@@ -42,6 +42,8 @@ startPolling()            Timer 1.5s，仅在键盘可见时跑
     ↓ 每 1.5s
 capture()
     ├─ pb.changeCount != lastChangeCount ?   ← 变了才继续
+    ├─ pb.hasImages → pb.image → pngData()
+    │     └─ store.upsertImage(data, pixel: "W×H")   ← 按内容 hash 去重
     ├─ pb.string
     └─ store.upsert(text, source: "keyboard")
             ├─ hash 命中已有 & 未删除 → updatedAt/rev++，挪到最前（去重）
@@ -72,6 +74,9 @@ panel.reload()
 | `source` | String | `app` / `keyboard` / `rewrite` / `remote` / `pc` |
 | `rev` | Int | **单调递增**，同步的唯一比较依据 |
 | `deleted` | Bool | 软删（tombstone），同步要传，否则别处会「复活」 |
+| `type` | String? | `nil`/`"text"` 文本，`"image"` 图片（老数据无此字段，解码补 nil） |
+| `attachment` | String? | 附件文件名，落在 `<容器>/attachments/<hash>.png` |
+| `pixelSize` | String? | `"800×600"`，只用于展示 |
 
 落盘：`<App Group>/clip-items.json`，全量 JSON 数组，`prettyPrinted + sortedKeys`。
 500 条上限（`ClipStore.maxItems`），超出按 `updatedAt` 裁，**置顶的永不裁**。
@@ -122,7 +127,7 @@ panel.reload()
 
 | 想加的东西 | 改这里 |
 |---|---|
-| 图片 / 富文本剪贴板 | `ClipItem` 加 `kind`+`attachmentPath`；`capture()` 里读 `pb.image`；blob 上传改二进制 |
+| ~~图片~~ | ✅ v15 已做：`ClipItem.type/attachment/pixelSize`、`upsertImage`、二进制 blob |
 | 敏感内容过滤（密码类） | `capture()` 里加判定，命中就 `return` 不入库 |
 | 记录来源 App | `capture()` 里取 `pb` 无此信息，需主 App 侧 `UIPasteboard.detectedPatterns` 或注入；扩展拿不到 |
 | 自动同步 | `AppModel` 的定时器 + `scenePhase`；iOS 后台限制大，别指望后台定时 |
@@ -138,6 +143,8 @@ panel.reload()
 | `KeyboardViewController.capture` | 1.5s 轮询，连续复制两次只留最后一次 | 会丢中间态（系统剪贴板本身也只留最后一次，接受） |
 | `ClipStore.save` | 全量重写 JSON | 500 条时约 1MB，键盘里同步写会卡 10–20ms（可接受，别再加字段） |
 | `SyncEngine` | 没做孤儿 blob 清理（PROPFIND） | 删掉的条目正文仍留在服务器 |
+| 键盘插入图片 | `insertText` 只能插文本 | 图片只能「复制到剪贴板」再长按粘贴 |
+| 附件目录 | 只增不删 | 删条目后 `attachments/` 里的图还在，需要定期清 |
 
 ---
 

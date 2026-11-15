@@ -19,12 +19,13 @@ CI 里会用 `codesign -d --entitlements` 回读并断言 `group.com.ouo.clipboa
 
 构建记录：<https://github.com/xiki45/ios-clip-poc/actions>
 
-### 0.1 键盘怎么用（v14）
+### 0.1 键盘怎么用（v15）
 
 | 操作 | 效果 |
 |---|---|
 | 切到 ClipKeyboard | 自动采集当前剪贴板，之后每 1.5s 轮询 `changeCount` |
-| 点条目 | 直接插入到光标处 |
+| 点条目（文本） | 直接插入到光标处 |
+| 点条目（图片） | 复制回系统剪贴板，长按输入框粘贴（`insertText` 插不了图） |
 | **点条目右侧 ✨** | 弹出重写菜单（推荐 / 编码 / 文本 / 哈希） |
 | 长按条目 | 同样的重写菜单 + 置顶 + 删除 |
 | 顶部 chip | 全部 / 置顶 / 链接 / JSON / 代码 / 今天 / 长文 |
