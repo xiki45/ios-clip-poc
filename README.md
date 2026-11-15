@@ -91,7 +91,6 @@ output/
 │   └── ClipKeyboard.entitlements
 ├── Shared/                    # 两个 target 共同编译
 │   ├── GroupStore.swift       # App Group 读写 + JSONL 日志 + 心跳
-│   └── Diagnostics.swift      # 用 SecTask* 探测 entitlement 是否生效
 ├── PocApp/
 │   ├── AppModel.swift        # 剪贴板库状态（含同步动作）
 │   ├── ContentView.swift     # 列表 / 编辑 / 设置
@@ -101,7 +100,6 @@ output/
 ├── work/sync-tests/          # 同步回归（本机可跑，无需设备）
 ├── build-ipa.sh               # 构建 + 写 entitlements + 打 IPA
 ├── docs/POC-CHECKLIST.md      # 逐条验证清单（照着勾）
-└── poc4-dylib/                # 可选：TrollFools 注入用的 dylib 模板
 ```
 
 **关键标识（要改就一起改）**
@@ -226,7 +224,6 @@ chmod +x build-ipa.sh
 | 1 ❌ | 走 localhost 补丁，或上 POC4（注入后不依赖 App Group 也能落库） |
 | 3 存活 > 5 分钟 | 可加常驻轮询，采集延迟从“开键盘才记”降到分钟级 |
 
-POC4（TrollFools 注入 SpringBoard）见 `poc4-dylib/README.md`，属于增强项，建议 POC1~3 跑完再决定要不要做。
 
 ---
 
@@ -234,5 +231,4 @@ POC4（TrollFools 注入 SpringBoard）见 `poc4-dylib/README.md`，属于增强
 
 - **日志用 JSONL 追加写**：两个进程并发写同一文件不会互相覆盖（`O_APPEND` 语义），便于判断“到底谁写了”。
 - **`GroupStore.effectiveDirectory`**：拿不到 App Group 时静默退化到私有沙盒，UI 上明确显示「私有 ❌」——避免“以为通了其实各写各的”。
-- **`Diagnostics` 用 dlsym 动态取 `SecTask*`**：符号缺失时降级而不是崩，且验证完可以整段删除。
 - **心跳与日志分离**：心跳是覆盖写（小），日志是追加写（大），避免定时器把日志刷爆。

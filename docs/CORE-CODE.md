@@ -2,7 +2,7 @@
 
 > 仓库：<https://github.com/xiki45/ios-clip-poc>（`main`）
 > 本地：`2026-11-05T19:18-mobile-ime-research/tasks/ios-poc-appgroup/output/`
-> 现状：v14 · 51 个提交 · Swift 2819 行（不含注释约 2000 行）
+> 现状：v15 · 53 个提交 · Swift 2732 行（不含注释约 1900 行）
 
 ---
 
@@ -20,7 +20,6 @@ PocApp/        宿主 App（管理界面 + 同步）
 | Shared | `Rewriter.swift` | 568 | 22 个重写算子 + 自动识别候选 | ★★★ |
 | Shared | `TextMatch.swift` | 36 | 检索匹配（多词 AND） | ★★ |
 | Shared | `GroupStore.swift` | 147 | App Group 容器定位 + JSONL 日志 + 心跳 | ★★ |
-| Shared | `Diagnostics.swift` | 87 | `SecTask*` 探测 entitlement | ⚠️ 已无人调用，可删 |
 | ClipKeyboard | `KeyboardViewController.swift` | 247 | 采集循环 / 插入 / 重写 / 轮询 | ★★★ |
 | ClipKeyboard | `ClipPanelView.swift` | 410 | 面板 UI（chip、列表、重写菜单） | ★★★ |
 | PocApp | `AppModel.swift` | 236 | 库状态 + 同步动作 | ★★★ |
@@ -139,8 +138,6 @@ panel.reload()
 | `KeyboardViewController.capture` | 1.5s 轮询，连续复制两次只留最后一次 | 会丢中间态（系统剪贴板本身也只留最后一次，接受） |
 | `ClipStore.save` | 全量重写 JSON | 500 条时约 1MB，键盘里同步写会卡 10–20ms（可接受，别再加字段） |
 | `SyncEngine` | 没做孤儿 blob 清理（PROPFIND） | 删掉的条目正文仍留在服务器 |
-| `Diagnostics.swift` | 无人调用 | 死代码，删了能少 87 行 |
-| 仓库根目录 | `inject/`、`poc4-dylib/`、`*.bak` 是微信输入法注入和早期草稿 | 与键盘无关，建议移出仓库 |
 
 ---
 

@@ -16,8 +16,6 @@
 		AA00000000000000000000DC /* TextMatch.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000D5 /* TextMatch.swift */; };
 		AA00000000000000000000B1 /* GroupStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F1 /* GroupStore.swift */; };
 		AA00000000000000000000B2 /* GroupStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F1 /* GroupStore.swift */; };
-		AA00000000000000000000B3 /* Diagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F2 /* Diagnostics.swift */; };
-		AA00000000000000000000B4 /* Diagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F2 /* Diagnostics.swift */; };
 		AA00000000000000000000B5 /* PocApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F3 /* PocApp.swift */; };
 		AA00000000000000000000B6 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F4 /* AppModel.swift */; };
 		AA00000000000000000000B7 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000F5 /* ContentView.swift */; };
@@ -58,7 +56,6 @@
 		AA00000000000000000000D4 /* Rewriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Rewriter.swift; sourceTree = "<group>"; };
 		AA00000000000000000000D5 /* TextMatch.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TextMatch.swift; sourceTree = "<group>"; };
 		AA00000000000000000000F1 /* GroupStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GroupStore.swift; sourceTree = "<group>"; };
-		AA00000000000000000000F2 /* Diagnostics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Diagnostics.swift; sourceTree = "<group>"; };
 		AA00000000000000000000F3 /* PocApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PocApp.swift; sourceTree = "<group>"; };
 		AA00000000000000000000F4 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
 		AA00000000000000000000F5 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
@@ -108,7 +105,6 @@
 			isa = PBXGroup;
 			children = (
 				AA00000000000000000000F1 /* GroupStore.swift */,
-				AA00000000000000000000F2 /* Diagnostics.swift */,
 				AA00000000000000000000D3 /* ClipModel.swift */,
 				AA00000000000000000000D4 /* Rewriter.swift */,
 				AA00000000000000000000D5 /* TextMatch.swift */,
@@ -250,7 +246,6 @@
 			buildActionMask = 2147483647;
 			files = (
 				AA00000000000000000000B1 /* GroupStore.swift in Sources */,
-				AA00000000000000000000B3 /* Diagnostics.swift in Sources */,
 				AA00000000000000000000B5 /* PocApp.swift in Sources */,
 				AA00000000000000000000B6 /* AppModel.swift in Sources */,
 				AA00000000000000000000B7 /* ContentView.swift in Sources */,
@@ -268,7 +263,6 @@
 			buildActionMask = 2147483647;
 			files = (
 				AA00000000000000000000B2 /* GroupStore.swift in Sources */,
-				AA00000000000000000000B4 /* Diagnostics.swift in Sources */,
 				AA00000000000000000000B8 /* KeyboardViewController.swift in Sources */,
 				AA00000000000000000000DE /* ClipPanelView.swift in Sources */,
 				AA00000000000000000000DA /* ClipModel.swift in Sources */,
