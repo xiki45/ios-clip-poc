@@ -1,165 +1,186 @@
 //
 //  AppModel.swift
-//  PocApp
+//  PocApp · 剪贴板库（v13 起是正经的管理界面，不再是 POC 诊断面板）
 //
-//  主 App 侧的验证面板：POC1（App Group）、POC2（键盘是否在写）、POC3（后台存活）。
+//  数据全部走 App Group 里的 clip-items.json，和键盘共用同一份文件，
+//  所以这里改完，键盘下次打开就是新数据。
 //
 
 import Foundation
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 @MainActor
-final class AppModel: ObservableObject {
+final class LibraryModel: ObservableObject {
 
-    @Published var report: String = ""
-    @Published var verdict: String = ""
-    @Published var entries: [PocLogEntry] = []
-    @Published var keyboardHeartbeat: String = "（尚未收到键盘心跳）"
-    @Published var lastKeyboardSeen: String = "—"
-    @Published var backgroundRunning = false
-    @Published var backgroundElapsed: Int = 0
-    @Published var backgroundRemaining: String = "—"
+    // MARK: - 数据
+
+    @Published var items: [ClipItem] = []
+    @Published var query: String = ""
+    @Published var filter: Filter = .all
     @Published var toast: String = ""
+    @Published var editing: ClipItem?
 
-    private var bgTask: UIBackgroundTaskIdentifier = .invalid
-    private var bgTimer: Timer?
-    private var refreshTimer: Timer?
-    private var bgStartedAt: Date?
+    // 调试信息（原 POC 面板的内容，收进设置页）
+    @Published var storagePath: String = ""
+    @Published var isShared: Bool = false
+    @Published var extensionList: String = ""
+    @Published var lastWrite: String = "—"
+
+    enum Filter: String, CaseIterable, Identifiable {
+        case all, pinned, url, json, code, today, long
+        var id: String { rawValue }
+        var title: String {
+            switch self {
+            case .all: return "全部"
+            case .pinned: return "置顶"
+            case .url: return "链接"
+            case .json: return "JSON"
+            case .code: return "代码"
+            case .today: return "今天"
+            case .long: return "长文"
+            }
+        }
+    }
+
+    private var store: ClipStore?
+    private var timer: Timer?
 
     init() {
-        refresh()
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
+        load()
+        // 键盘在别的进程写文件，这里没有文件监听可用，只能轮询
+        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.load(announce: false) }
         }
     }
 
-    // MARK: - 刷新
+    // MARK: - 加载
 
-    func refresh() {
-        report = Diagnostics.report(source: "app")
-        verdict = Diagnostics.verdict(source: "app")
-        entries = GroupStore.readAll(limit: 200).reversed().map { $0 }
+    func load(announce: Bool = true) {
+        guard let dir = GroupStore.effectiveDirectory else {
+            toast = "没有可写目录"
+            return
+        }
+        if store == nil {
+            store = ClipStore(directory: dir.url)
+        }
+        store?.load()
+        isShared = dir.isShared
+        storagePath = dir.url.path
+        extensionList = embeddedExtension
+        applyFilter()
+        if announce { /* 首帧静默 */ }
+    }
 
-        let hb = GroupStore.readHeartbeat()
-        if !hb.isEmpty {
-            keyboardHeartbeat = hb.map { "\($0.key): \($0.value)" }.sorted().joined(separator: "\n")
-            if let ts = hb["ts"] as? Double {
-                let d = Date(timeIntervalSince1970: ts)
-                lastKeyboardSeen = "\(Self.fmt.string(from: d))（\(Int(Date().timeIntervalSince(d)))s 前）"
-            }
-        } else {
-            keyboardHeartbeat = "（尚未收到键盘心跳）"
-            lastKeyboardSeen = "—"
+    private func applyFilter() {
+        var list = store?.visibleItems(limit: 1000) ?? []
+
+        switch filter {
+        case .all: break
+        case .pinned: list = list.filter { $0.pinned }
+        case .url: list = list.filter { $0.kind == "url" }
+        case .json: list = list.filter { $0.kind == "json" }
+        case .code: list = list.filter { $0.kind == "code" }
+        case .today: list = list.filter { Calendar.current.isDateInToday($0.updatedAt) }
+        case .long: list = list.filter { $0.text.count > 200 }
         }
 
-        if backgroundRunning {
-            backgroundElapsed = Int(Date().timeIntervalSince(bgStartedAt ?? Date()))
-            let r = UIApplication.shared.backgroundTimeRemaining
-            backgroundRemaining = r.isFinite ? String(format: "%.0fs", r) : "∞（可能已被特权签名放行）"
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !q.isEmpty {
+            list = list.filter { TextMatch.matches($0.text, query: q) }
+        }
+        items = list
+    }
+
+    func onQueryChanged() { applyFilter() }
+
+    // MARK: - 条目操作
+
+    func togglePin(_ item: ClipItem) {
+        store?.togglePin(id: item.id)
+        load()
+        toast = item.pinned ? "已取消置顶" : "已置顶"
+    }
+
+    func delete(_ item: ClipItem) {
+        store?.remove(id: item.id)
+        load()
+        toast = "已删除"
+    }
+
+    func copy(_ item: ClipItem) {
+        UIPasteboard.general.string = item.text
+        lastWrite = Self.fmt.string(from: Date())
+        toast = "已复制到剪贴板"
+    }
+
+    func save(id: String, text: String) {
+        let ok = store?.update(id: id, text: text) ?? false
+        load()
+        toast = ok ? "已保存" : "保存失败（内容为空？）"
+    }
+
+    func clearAll() {
+        store?.clearAll()
+        load()
+        toast = "已清空（键盘里的历史也会一起没了）"
+    }
+
+    // MARK: - 导入导出
+
+    func exportFile() -> URL? {
+        guard let data = store?.exportData() else { return nil }
+        let name = "clip-items-\(Self.stamp.string(from: Date())).json"
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        do {
+            try data.write(to: url)
+            return url
+        } catch {
+            toast = "导出失败：\(error.localizedDescription)"
+            return nil
         }
     }
 
-    // MARK: - POC 1：App 侧写入
-
-    func writeFromApp() {
-        let batch = (1...10).map {
-            PocLogEntry(source: "app", event: "group_write",
-                        detail: "app-batch #\($0) @\(Self.fmt.string(from: Date()))")
+    func importFile(_ url: URL) {
+        let got = url.startAccessingSecurityScopedResource()
+        defer { if got { url.stopAccessingSecurityScopedResource() } }
+        guard let data = try? Data(contentsOf: url) else {
+            toast = "读不了这个文件"
+            return
         }
-        GroupStore.appendBulk(batch)
-        toast = "已写入 10 条（\(GroupStore.effectiveDirectory?.isShared == true ? "App Group" : "私有沙盒")）"
-        refresh()
+        let r = store?.importMerge(data) ?? (0, 0)
+        load()
+        toast = "导入完成：新增 \(r.0) 条，更新 \(r.1) 条"
     }
 
-    func clearLog() {
-        GroupStore.clear()
-        toast = "日志已清空"
-        refresh()
+    // MARK: - 统计
+
+    var totalCount: Int { store?.items.filter { !$0.deleted }.count ?? 0 }
+    var pinnedCount: Int { store?.items.filter { !$0.deleted && $0.pinned }.count ?? 0 }
+    var byteSize: Int {
+        guard let url = GroupStore.effectiveDirectory?.url.appendingPathComponent(ClipStore.fileName),
+              let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let n = attrs[.size] as? NSNumber else { return 0 }
+        return n.intValue
     }
 
-    // MARK: - POC 3：后台存活
-
-    func toggleBackgroundHeartbeat() {
-        backgroundRunning ? stopBackground() : startBackground()
-    }
-
-    private func startBackground() {
-        guard !backgroundRunning else { return }
-        bgStartedAt = Date()
-        backgroundElapsed = 0
-        backgroundRunning = true
-
-        bgTask = UIApplication.shared.beginBackgroundTask(withName: "poc-heartbeat") { [weak self] in
-            Task { @MainActor in
-                self?.appendBG(event: "bg_expired", detail: "系统即将终止后台任务")
-                self?.stopBackground()
-            }
-        }
-
-        appendBG(event: "bg_start", detail: "beginBackgroundTask 返回 \(bgTask.rawValue)")
-
-        bgTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self else { return }
-                let elapsed = Int(Date().timeIntervalSince(self.bgStartedAt ?? Date()))
-                self.appendBG(event: "bg_heartbeat", detail: "elapsed=\(elapsed)s")
-                GroupStore.writeHeartbeat([
-                    "ts": Date().timeIntervalSince1970,
-                    "source": "app-bg",
-                    "elapsed": elapsed
-                ])
-            }
-        }
-    }
-
-    private func stopBackground() {
-        if bgTask != .invalid {
-            UIApplication.shared.endBackgroundTask(bgTask)
-            bgTask = .invalid
-        }
-        bgTimer?.invalidate()
-        bgTimer = nil
-        backgroundRunning = false
-    }
-
-    private func appendBG(event: String, detail: String) {
-        let r = UIApplication.shared.backgroundTimeRemaining
-        let remain = r.isFinite ? String(format: "%.1f", r) : "inf"
-        GroupStore.append(PocLogEntry(source: "app", event: event,
-                                      detail: "\(detail); bgRemaining=\(remain)"))
+    var embeddedExtension: String {
+        guard let url = Bundle.main.builtInPlugInsURL,
+              let names = try? FileManager.default.contentsOfDirectory(atPath: url.path),
+              !names.isEmpty else { return "未找到 PlugIns（扩展没嵌进来）" }
+        return names.joined(separator: ", ")
     }
 
     // MARK: - 辅助
 
-    func copyTestText() {
-        let text = "POC-TEXT-\(Int(Date().timeIntervalSince1970)) 你好 base64 aGVsbG8="
-        UIPasteboard.general.string = text
-        toast = "已写入系统剪贴板：\(text)"
-    }
-
-    /// 主 App 读剪贴板（对照组：前台 App 应始终可读）
-    func readPasteboardFromApp() {
-        let s = UIPasteboard.general.string ?? "nil"
-        GroupStore.append(PocLogEntry(source: "app", event: "pasteboard_app",
-                                      detail: "len=\(s.count) changeCount=\(UIPasteboard.general.changeCount) preview=\(String(s.prefix(60)))"))
-        toast = "App 读到：\(s.prefix(40))…"
-        refresh()
-    }
-
-    /// 扩展是否被嵌进 App（未嵌则设置里看不到键盘）
-    var embeddedExtension: String {
-        guard let url = Bundle.main.builtInPlugInsURL,
-              let items = try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil) else {
-            return "未找到 PlugIns 目录"
-        }
-        let names = items.map { $0.lastPathComponent }
-        return names.isEmpty ? "PlugIns 为空（扩展没嵌进来）" : names.joined(separator: ", ")
-    }
-
     static let fmt: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "HH:mm:ss"
-        return f
+        let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f
+    }()
+    static let stamp: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "yyyyMMdd-HHmmss"; return f
+    }()
+    static let dayFmt: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "MM-dd HH:mm"; return f
     }()
 }

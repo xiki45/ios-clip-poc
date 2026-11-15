@@ -138,6 +138,64 @@ public final class ClipStore {
         save()
     }
 
+    /// 编辑正文：重算 hash、rev+1，并把条目挪到最前
+    @discardableResult
+    public func update(id: String, text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.count <= 200_000,
+              let idx = items.firstIndex(where: { $0.id == id }) else { return false }
+        items[idx].text = text
+        items[idx].hash = ClipItem.sha256(text)
+        items[idx].updatedAt = Date()
+        items[idx].rev += 1
+        let moved = items.remove(at: idx)
+        items.insert(moved, at: 0)
+        save()
+        return true
+    }
+
+    // MARK: 导入导出
+
+    public func exportData() -> Data? {
+        let enc = JSONEncoder()
+        enc.dateEncodingStrategy = .iso8601
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return try? enc.encode(items)
+    }
+
+    /// 按 id/rev 归并导入。返回 (新增, 更新)
+    @discardableResult
+    public func importMerge(_ data: Data) -> (Int, Int) {
+        let dec = JSONDecoder()
+        dec.dateDecodingStrategy = .iso8601
+        guard let incoming = try? dec.decode([ClipItem].self, from: data) else { return (0, 0) }
+
+        var added = 0, updated = 0
+        for inc in incoming {
+            if let idx = items.firstIndex(where: { $0.id == inc.id }) {
+                if inc.rev > items[idx].rev {
+                    items[idx] = inc
+                    updated += 1
+                }
+            } else if let idx = items.firstIndex(where: { $0.hash == inc.hash && $0.id != inc.id }) {
+                if inc.updatedAt > items[idx].updatedAt {
+                    items[idx].updatedAt = inc.updatedAt
+                    items[idx].rev += 1
+                    updated += 1
+                }
+            } else {
+                items.append(inc)
+                added += 1
+            }
+        }
+        if added + updated > 0 {
+            reorder()
+            trim()
+            save()
+        }
+        return (added, updated)
+    }
+
     // MARK: 查询
 
     /// 展示顺序：置顶在前，其余按更新时间倒序
